@@ -63,6 +63,15 @@ pub struct AgentState {
     pub last_response_text: Option<String>,
     /// Last error, if the loop stopped abnormally (budget/permission/etc).
     pub last_error: Option<String>,
+    /// Progress signature (see `progress_signature()`) observed the last time
+    /// `TerminationGuard::evaluate` ran, used by the no-progress detector to
+    /// notice when consecutive iterations leave no observable trace of work.
+    pub last_progress_signature: Option<u64>,
+    /// Number of consecutive `TerminationGuard::evaluate` calls whose
+    /// `progress_signature()` matched `last_progress_signature`, i.e. state
+    /// that looks identical to the previous check. Reset to 0 whenever the
+    /// signature changes.
+    pub stale_iterations: u32,
 }
 
 impl AgentState {
@@ -81,7 +90,28 @@ impl AgentState {
             used_self_correction: false,
             last_response_text: None,
             last_error: None,
+            last_progress_signature: None,
+            stale_iterations: 0,
         }
+    }
+
+    /// A cheap fingerprint of "observable work done so far": counts of
+    /// touched files, commands run, completed plan steps, decisions logged,
+    /// and the last response text. Two turns with an identical signature
+    /// produced no new observable effect, which is the "no-progress" signal
+    /// from spec `03-agent-loop-engine.md` Termination Criteria. Not a
+    /// cryptographic hash — collisions are acceptable since this only gates a
+    /// heuristic stop condition, and a false "no progress" stop is safe
+    /// (the loop halts rather than spinning forever).
+    pub fn progress_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.touched_files.len().hash(&mut hasher);
+        self.commands_run.len().hash(&mut hasher);
+        self.plan.completed_steps.len().hash(&mut hasher);
+        self.decisions_made.len().hash(&mut hasher);
+        self.last_response_text.hash(&mut hasher);
+        hasher.finish()
     }
 }
 

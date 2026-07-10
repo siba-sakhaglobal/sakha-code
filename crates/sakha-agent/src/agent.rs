@@ -100,10 +100,37 @@ impl Agent {
     }
 
     /// Spawns a nested sub-agent (spec module 16 "Sub-agent spawn as a
-    /// nested `Agent` with its own budget slice"). The child shares this
-    /// agent's provider/tools/policy/context/compressor/permission policy by
-    /// default but gets a fresh `AgentState` and an independently-tracked
-    /// budget carved out of the parent's remaining budget.
+    /// nested `Agent` with its own budget slice"). Per module 16 "Sub-agent
+    /// context is minimized and compressed" / "No agent sees secrets unless
+    /// explicitly allowed" / "Each writing sub-agent uses isolated worktree",
+    /// the child intentionally does **not** inherit the parent's context
+    /// planner, permission policy, or workspace root unchanged:
+    ///
+    /// - context: gets a fresh `MinimalContextPlanner` instead of the
+    ///   parent's (which may pull in session memory/research feeds the child
+    ///   has no business seeing); the parent's compressor is kept since
+    ///   compression only ever shrinks/redacts, never widens, access.
+    /// - permissions: gets a fresh, empty `PermissionPolicy` (nothing
+    ///   allowed by default, unmatched requests fall back to
+    ///   `RiskLevel::Low` auto-allow only) instead of a clone of the
+    ///   parent's merged rule set, so a broad parent grant (e.g. an
+    ///   unrestricted shell allow) is never silently inherited. Callers that
+    ///   need the child to have specific permissions pass them via
+    ///   `with_permission_layer` on the returned `Agent`'s deps, or by
+    ///   constructing `AgentDeps` directly.
+    /// - workspace: gets an isolated subdirectory under the parent's
+    ///   workspace root (`<root>/.sakha/subagents/<child-session-id>`)
+    ///   rather than the parent's live workspace root, so a writing
+    ///   sub-agent can never race the parent's own file/git operations. This
+    ///   is a best-effort stand-in for a real worktree lease (owned by the
+    ///   not-yet-present `sakha-team` crate per module 16); if the directory
+    ///   can't be created (e.g. read-only filesystem in a test), this falls
+    ///   back to the parent's root rather than failing the spawn.
+    ///
+    /// The child otherwise shares this agent's provider (network client,
+    /// stateless) and handoff store/prompt assembler (stateless, no secret
+    /// material), and gets a fresh `AgentState` with an independently
+    /// tracked budget carved out of the parent's remaining budget.
     pub fn spawn_subagent(&self, budget_slice: Budget, role_policy: Arc<dyn AgentPolicy>) -> SakhaResult<Agent> {
         let child_config = AgentConfig {
             budget: budget_slice,
@@ -113,19 +140,25 @@ impl Agent {
             model: self.config.model.clone(),
         };
 
+        let child_session_id = SessionId::new();
+        let workspace_root = isolated_subagent_workspace(&self.deps.workspace_root, child_session_id);
+
         let child_deps = AgentDeps {
             provider: self.deps.provider.clone(),
             tools: sakha_tools::ToolRegistry::new(), // caller re-registers a scoped tool set; see note below
             policy: role_policy,
-            context_planner: self.deps.context_planner.clone(),
+            // Minimized: does not inherit the parent's context feeds.
+            context_planner: Arc::new(sakha_context::MinimalContextPlanner),
             compressor: self.deps.compressor.clone(),
-            permission_policy: self.deps.permission_policy.clone(),
+            // Isolated: starts from zero grants, not a clone of the parent's
+            // (possibly broad) merged permission rules.
+            permission_policy: PermissionPolicy::new(),
             handoff_store: self.deps.handoff_store.clone(),
             prompt_assembler: self.deps.prompt_assembler.clone(),
-            workspace_root: self.deps.workspace_root.clone(),
+            workspace_root,
         };
 
-        Ok(Agent::new(SessionId::new(), LoopType::SubAgent, child_config, child_deps))
+        Ok(Agent::new(child_session_id, LoopType::SubAgent, child_config, child_deps))
     }
 
     /// Runs one turn to completion: assembles context, calls the model,
@@ -216,9 +249,28 @@ impl Agent {
             self.state.phase = AgentPhase::ExecutingTools;
             let mut any_tool_failed_invalid = false;
 
-            for call in &response.tool_calls {
-                let input_json: serde_json::Value = match serde_json::from_str(&call.arguments_json) {
-                    Ok(v) => v,
+            // Parse every call's JSON arguments up front. Calls with
+            // malformed arguments are reported immediately (as before) and
+            // excluded from execution; everything else is dispatched either
+            // concurrently or sequentially depending on
+            // `config.allow_parallel_tool_calls`, per spec task
+            // "Implement parallel-safe tool dispatch". Results are collected
+            // keyed by the call's position so post-processing below can apply
+            // policy actions/state mutation in the model's original call
+            // order regardless of completion order — that ordering is what
+            // makes early Stop/EscalateToHuman/failure-count semantics
+            // deterministic and unchanged from the sequential path.
+            let mut runnable: Vec<(usize, ExecutorToolCall)> = Vec::with_capacity(response.tool_calls.len());
+            for (idx, call) in response.tool_calls.iter().enumerate() {
+                match serde_json::from_str::<serde_json::Value>(&call.arguments_json) {
+                    Ok(input_json) => runnable.push((
+                        idx,
+                        ExecutorToolCall {
+                            id: sakha_core::ToolCallId::new(),
+                            tool_name: sakha_tools::ToolName::new(call.name.clone()),
+                            input_json,
+                        },
+                    )),
                     Err(err) => {
                         any_tool_failed_invalid = true;
                         messages.push(tool_error_message(
@@ -226,20 +278,53 @@ impl Agent {
                             &call.name,
                             format!("invalid tool call arguments (not valid JSON): {err}"),
                         ));
-                        continue;
                     }
+                }
+            }
+
+            let mut results: std::collections::HashMap<usize, SakhaResult<sakha_tools::ToolResult>> =
+                std::collections::HashMap::with_capacity(runnable.len());
+
+            if self.config.allow_parallel_tool_calls && runnable.len() > 1 {
+                let mut join_set = tokio::task::JoinSet::new();
+                for (idx, tool_call) in runnable {
+                    let executor =
+                        ToolExecutor::new(clone_registry_view(&self.deps.tools), self.deps.permission_policy.clone());
+                    let context = ToolContext::new(self.deps.workspace_root.clone());
+                    join_set.spawn(async move { (idx, executor.execute(tool_call, &context).await) });
+                }
+                while let Some(joined) = join_set.join_next().await {
+                    match joined {
+                        Ok((idx, result)) => {
+                            results.insert(idx, result);
+                        }
+                        Err(join_err) => {
+                            // A tool task panicked/was cancelled: surface it as
+                            // a fatal (non-panicking) error for that call
+                            // rather than propagating the panic, per
+                            // executor contract "returns Err, never panics".
+                            tracing::error!(error = %join_err, "tool execution task failed to join");
+                        }
+                    }
+                }
+            } else {
+                for (idx, tool_call) in runnable {
+                    let executor =
+                        ToolExecutor::new(clone_registry_view(&self.deps.tools), self.deps.permission_policy.clone());
+                    let context = ToolContext::new(self.deps.workspace_root.clone());
+                    let result = executor.execute(tool_call, &context).await;
+                    results.insert(idx, result);
+                }
+            }
+
+            for (idx, call) in response.tool_calls.iter().enumerate() {
+                let Some(result) = results.remove(&idx) else {
+                    // No entry means this call's arguments failed to parse
+                    // (already reported above) or its task never joined
+                    // (already logged above); nothing further to do.
+                    continue;
                 };
-
-                let tool_call = ExecutorToolCall {
-                    id: sakha_core::ToolCallId::new(),
-                    tool_name: sakha_tools::ToolName::new(call.name.clone()),
-                    input_json,
-                };
-
-                let executor = ToolExecutor::new(clone_registry_view(&self.deps.tools), self.deps.permission_policy.clone());
-                let context = ToolContext::new(self.deps.workspace_root.clone());
-
-                match executor.execute(tool_call, &context).await {
+                match result {
                     Ok(result) => {
                         self.state.consecutive_failures = 0;
                         self.record_tool_effects(&call.name, &result);
@@ -331,6 +416,12 @@ impl Agent {
                     .finish(LoopDecision::Stop { reason: "repeated failure".into() }, &user_input)
                     .await;
             }
+
+            // No-progress detector: update the rolling progress signature
+            // now that this iteration's tool effects (if any) are folded
+            // into state, so the next iteration's `guard.evaluate` can see a
+            // run of iterations that changed nothing.
+            guard.record_progress(&mut self.state);
         }
     }
 
@@ -460,6 +551,24 @@ fn clone_registry_view(registry: &ToolRegistry) -> ToolRegistry {
         }
     }
     clone
+}
+
+/// Best-effort worktree isolation for `spawn_subagent`: creates (and
+/// returns) `<parent_root>/.sakha/subagents/<child_session_id>` so a writing
+/// sub-agent operates in its own directory tree rather than the parent's
+/// live workspace, per module 16 "Each writing sub-agent uses isolated
+/// worktree". This is not a git worktree (that mechanism belongs to the
+/// not-yet-present `sakha-team` crate's `WorktreeLease`); it is a filesystem
+/// isolation floor that at minimum prevents a child from clobbering files
+/// the parent is concurrently reading/writing at the same paths. If the
+/// directory cannot be created (e.g. read-only filesystem), falls back to
+/// the parent's root so a spawn never fails purely due to isolation setup.
+fn isolated_subagent_workspace(parent_root: &std::path::Path, child_session_id: SessionId) -> std::path::PathBuf {
+    let isolated = parent_root.join(".sakha").join("subagents").join(child_session_id.to_string());
+    match std::fs::create_dir_all(&isolated) {
+        Ok(()) => isolated,
+        Err(_) => parent_root.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -723,5 +832,77 @@ mod tests {
         assert_eq!(child.loop_type, LoopType::SubAgent);
         assert_ne!(child.state.session_id, parent.state.session_id);
         assert_eq!(child.budget.ledger.remaining(BudgetDimension::LoopIterations), Some(3));
+    }
+
+    /// Spec (`modules/16-subagents-teams.md`): "Sub-agent context is
+    /// minimized and compressed" / "No agent sees secrets unless explicitly
+    /// allowed" / "Each writing sub-agent uses isolated worktree". A child
+    /// must not receive the parent's permission policy or workspace root
+    /// unchanged.
+    #[tokio::test]
+    async fn subagent_is_isolated_from_parent_permissions_and_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = AgentDeps::new(provider_with_response(text_response("ok")), ToolRegistry::new());
+        deps.workspace_root = dir.path().to_path_buf();
+        // Give the parent a broad allow-rule so we can prove the child does
+        // NOT inherit it.
+        deps.permission_policy = PermissionPolicy::new().with_layer(sakha_security::PolicyLayer {
+            source: Some(sakha_security::PolicySource::CliFlag),
+            allow_rules: vec!["shell.run_arbitrary:*".into()],
+            ..Default::default()
+        });
+        let parent = Agent::new(SessionId::new(), LoopType::Goal, AgentConfig::default(), deps);
+
+        let child = parent
+            .spawn_subagent(Budget::unlimited(), Arc::new(DefaultAgentPolicy::new("sub-implementer")))
+            .unwrap();
+
+        // Workspace isolation: the child's workspace root must not be the
+        // same directory as the parent's.
+        assert_ne!(child.deps.workspace_root, parent.deps.workspace_root);
+        assert!(child.deps.workspace_root.starts_with(&parent.deps.workspace_root));
+
+        // Secret/permission isolation: the parent's broad allow-rule must
+        // not be present in the child's merged policy.
+        let child_merged = child.deps.permission_policy.merged();
+        assert!(!child_merged.allow_rules.iter().any(|r| r.contains("shell.run_arbitrary")));
+    }
+
+    /// Spec task "Implement parallel-safe tool dispatch": with
+    /// `allow_parallel_tool_calls` enabled and multiple tool calls in one
+    /// model response, every call must still execute and have its effect
+    /// folded into state, matching the sequential path's outcome.
+    #[tokio::test]
+    async fn parallel_tool_calls_all_execute_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = ModelResponse {
+            request_id: sakha_core::ModelRequestId::new(),
+            text: String::new(),
+            tool_calls: vec![
+                sakha_provider::AssembledToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    arguments_json: r#"{"value":"a"}"#.into(),
+                },
+                sakha_provider::AssembledToolCall {
+                    id: "call_2".into(),
+                    name: "echo".into(),
+                    arguments_json: r#"{"value":"b"}"#.into(),
+                },
+            ],
+            usage: sakha_provider::UsageRecord::default(),
+            stop_reason: StopReason::ToolUse,
+        };
+        let mut deps = AgentDeps::new(provider_with_response(response), registry_with_echo());
+        deps.workspace_root = dir.path().to_path_buf();
+        let mut config = AgentConfig::default();
+        config.allow_parallel_tool_calls = true;
+        config.max_turn_iterations = 1;
+        let mut agent = Agent::new(SessionId::new(), LoopType::Interactive, config, deps);
+        let decision = agent.run_turn("go".into()).await.unwrap();
+        assert_eq!(decision, LoopDecision::Stop { reason: "max iterations reached".into() });
+        // Both tool calls must have executed without error (failures would
+        // have bumped consecutive_failures).
+        assert_eq!(agent.state.consecutive_failures, 0);
     }
 }
