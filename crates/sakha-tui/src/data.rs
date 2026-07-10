@@ -125,27 +125,91 @@ pub trait DataSource: Send + Sync {
     async fn refresh(&self, session_id: SessionId) -> SakhaResult<RefreshSnapshot>;
 }
 
-/// Direct `sakha-memory` backed data source. Tool call and loop data are not
-/// yet persisted by `sakha-memory`/`sakha-loop` in a queryable form (loop
-/// state currently lives only in-process inside `LoopRuntime`), so this
-/// source accepts optional feeder closures/snapshots for those; by default
-/// they are empty, which is a safe, always-available fallback.
-pub struct MemoryDataSource {
-    session_store: Arc<dyn SessionStore>,
+/// A pluggable source of tool-call summaries for [`MemoryDataSource`],
+/// decoupled from `sakha-tools`' registry/executor types so this crate does
+/// not need to depend on `sakha-tools` just to render a status list. Callers
+/// that have a live `sakha-tools` registry/executor implement this to feed
+/// real data; [`NoToolCalls`] is the safe, always-available default.
+pub trait ToolCallFeed: Send + Sync {
+    fn tool_calls(&self) -> Vec<ToolCallSummary>;
 }
 
-impl MemoryDataSource {
+/// A pluggable source of loop summaries for [`MemoryDataSource`], decoupled
+/// from `sakha-loop::LoopRuntime` (which does not currently expose a public
+/// "list all loops" accessor on its private `entries` map). Callers that
+/// have a live `LoopRuntime` (or another `LoopController`) implement this to
+/// feed real data; [`NoLoops`] is the safe, always-available default.
+pub trait LoopFeed: Send + Sync {
+    fn loops(&self) -> Vec<LoopSummary>;
+}
+
+/// Default [`ToolCallFeed`]: always empty. Used when no live tool registry
+/// is wired in (e.g. offline/demo rendering).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoToolCalls;
+
+impl ToolCallFeed for NoToolCalls {
+    fn tool_calls(&self) -> Vec<ToolCallSummary> {
+        Vec::new()
+    }
+}
+
+/// Default [`LoopFeed`]: always empty. Used when no live loop runtime is
+/// wired in (e.g. offline/demo rendering).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoLoops;
+
+impl LoopFeed for NoLoops {
+    fn loops(&self) -> Vec<LoopSummary> {
+        Vec::new()
+    }
+}
+
+/// Direct `sakha-memory` backed data source. Session/turn history and cost
+/// come straight from `sakha-memory`/`sakha-observability`; tool-call and
+/// loop data are not yet persisted in a queryable form (loop state
+/// currently lives only in-process inside `LoopRuntime`, and tool-call
+/// history is not yet durable), so this source is generic over a
+/// [`ToolCallFeed`]/[`LoopFeed`] pair the caller supplies — defaulting to
+/// [`NoToolCalls`]/[`NoLoops`] (an explicit, documented empty fallback)
+/// rather than silently hardcoding empty data with no way to plug in a real
+/// source.
+pub struct MemoryDataSource<T = NoToolCalls, L = NoLoops>
+where
+    T: ToolCallFeed,
+    L: LoopFeed,
+{
+    session_store: Arc<dyn SessionStore>,
+    tool_calls: T,
+    loops: L,
+}
+
+impl MemoryDataSource<NoToolCalls, NoLoops> {
     pub fn new(session_store: Arc<dyn SessionStore>) -> Self {
-        Self { session_store }
+        Self { session_store, tool_calls: NoToolCalls, loops: NoLoops }
+    }
+}
+
+impl<T: ToolCallFeed, L: LoopFeed> MemoryDataSource<T, L> {
+    /// Builds a data source backed by real tool-call/loop feeds in addition
+    /// to `sakha-memory` session/turn history.
+    pub fn with_feeds(session_store: Arc<dyn SessionStore>, tool_calls: T, loops: L) -> Self {
+        Self { session_store, tool_calls, loops }
     }
 }
 
 #[async_trait]
-impl DataSource for MemoryDataSource {
+impl<T: ToolCallFeed, L: LoopFeed> DataSource for MemoryDataSource<T, L> {
     async fn refresh(&self, session_id: SessionId) -> SakhaResult<RefreshSnapshot> {
         let session = self.session_store.get_session(session_id).await?;
         let turns = self.session_store.list_turns(session_id).await?;
-        Ok(RefreshSnapshot { session, turns, tool_calls: Vec::new(), loops: Vec::new(), cost: CostSnapshot::default() })
+        Ok(RefreshSnapshot {
+            session,
+            turns,
+            tool_calls: self.tool_calls.tool_calls(),
+            loops: self.loops.loops(),
+            cost: CostSnapshot::default(),
+        })
     }
 }
 
@@ -224,5 +288,62 @@ mod tests {
         let source = StaticDataSource::new(snapshot);
         let out = source.refresh(SessionId::new()).await.unwrap();
         assert_eq!(out.cost.cost_micros, 42);
+    }
+
+    struct FixedToolCalls(Vec<ToolCallSummary>);
+    impl ToolCallFeed for FixedToolCalls {
+        fn tool_calls(&self) -> Vec<ToolCallSummary> {
+            self.0.clone()
+        }
+    }
+
+    struct FixedLoops(Vec<LoopSummary>);
+    impl LoopFeed for FixedLoops {
+        fn loops(&self) -> Vec<LoopSummary> {
+            self.0.clone()
+        }
+    }
+
+    /// Guards against the `MemoryDataSource` contract silently regressing to
+    /// always-empty `tool_calls`/`loops`: a caller-supplied feed must show up
+    /// in the refreshed snapshot.
+    #[tokio::test]
+    async fn memory_data_source_with_feeds_populates_tool_calls_and_loops() {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let tool_call = ToolCallSummary {
+            id: ToolCallId::new(),
+            tool_name: "shell.run".into(),
+            status: ToolCallStatus::Succeeded,
+            risk_level: "low".into(),
+            summary: "ran cargo test".into(),
+        };
+        let loop_summary = LoopSummary {
+            id: LoopId::new(),
+            objective: "ship it".into(),
+            kind: "agent".into(),
+            state: LoopState::Running,
+            iterations_completed: 1,
+            max_iterations: 10,
+        };
+        let source = MemoryDataSource::with_feeds(
+            store,
+            FixedToolCalls(vec![tool_call.clone()]),
+            FixedLoops(vec![loop_summary.clone()]),
+        );
+
+        let snapshot = source.refresh(SessionId::new()).await.unwrap();
+        assert_eq!(snapshot.tool_calls.len(), 1);
+        assert_eq!(snapshot.tool_calls[0].tool_name, "shell.run");
+        assert_eq!(snapshot.loops.len(), 1);
+        assert_eq!(snapshot.loops[0].objective, "ship it");
+    }
+
+    #[tokio::test]
+    async fn memory_data_source_default_feeds_are_explicitly_empty() {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let source = MemoryDataSource::new(store);
+        let snapshot = source.refresh(SessionId::new()).await.unwrap();
+        assert!(snapshot.tool_calls.is_empty());
+        assert!(snapshot.loops.is_empty());
     }
 }

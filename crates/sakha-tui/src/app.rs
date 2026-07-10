@@ -61,6 +61,11 @@ impl TuiApp {
             Action::SelectSession => self.active_view = View::Session,
             Action::SelectTools => self.active_view = View::Tools,
             Action::SelectLoops => self.active_view = View::Loops,
+            Action::SelectDiff => self.active_view = View::Diff,
+            Action::SelectProvider => self.active_view = View::Provider,
+            Action::SelectMemory => self.active_view = View::Memory,
+            Action::SelectResearch => self.active_view = View::Research,
+            Action::SelectCompression => self.active_view = View::Compression,
             Action::MoveUp => self.move_selection_up(),
             Action::MoveDown => self.move_selection_down(),
             Action::Refresh => self.refresh_requested = true,
@@ -73,6 +78,10 @@ impl TuiApp {
             View::Session => self.session_view.move_up(),
             View::Tools => self.tools_view.move_up(),
             View::Loops => self.loops_view.move_up(),
+            // The remaining screens (Diff/Provider/Memory/Research/
+            // Compression) don't yet have a selectable list of their own;
+            // navigation is a no-op until their data-backed views land.
+            View::Diff | View::Provider | View::Memory | View::Research | View::Compression => {}
         }
     }
 
@@ -81,6 +90,7 @@ impl TuiApp {
             View::Session => self.session_view.move_down(),
             View::Tools => self.tools_view.move_down(),
             View::Loops => self.loops_view.move_down(),
+            View::Diff | View::Provider | View::Memory | View::Research | View::Compression => {}
         }
     }
 
@@ -148,8 +158,12 @@ mod tests {
         assert_eq!(app.active_view, View::Tools);
         app.on_event(AppEvent::Key(KeyEvent::new(KeyCode::Tab)));
         assert_eq!(app.active_view, View::Loops);
-        app.on_event(AppEvent::Key(KeyEvent::new(KeyCode::Tab)));
-        assert_eq!(app.active_view, View::Session);
+        // Tab continues through the remaining screens (per spec "TUI
+        // Screens") before wrapping back to Session.
+        for expected in [View::Diff, View::Provider, View::Memory, View::Research, View::Compression, View::Session] {
+            app.on_event(AppEvent::Key(KeyEvent::new(KeyCode::Tab)));
+            assert_eq!(app.active_view, expected);
+        }
     }
 
     #[test]

@@ -31,12 +31,22 @@ impl InMemoryArtifactStore {
     }
 }
 
+/// Maps a poisoned-mutex error to a non-panicking `SakhaError`. A poisoned
+/// lock means some other task panicked while holding it; rather than
+/// propagating that panic to every future caller, surface it as a fatal
+/// (but catchable) error so normal request-handling flow never panics.
+fn poison_err(what: &str) -> SakhaError {
+    SakhaError::fatal("sakha-memory", format!("{what}: lock poisoned by a prior panic"))
+}
+
 #[async_trait]
 impl ArtifactStore for InMemoryArtifactStore {
     async fn put(&self, kind: ArtifactKind, bytes: Vec<u8>, label: Option<String>) -> SakhaResult<ArtifactRef> {
         let hash = sakha_core::artifact::content_hash_hex(&bytes);
         let byte_len = bytes.len() as u64;
-        self.blobs.lock().unwrap().insert(hash.clone(), bytes);
+        let mut blobs = self.blobs.lock().map_err(|_| poison_err("put"))?;
+        blobs.insert(hash.clone(), bytes);
+        drop(blobs);
         let mut artifact = ArtifactRef::new(kind, hash, byte_len);
         if let Some(label) = label {
             artifact = artifact.with_label(label);
@@ -45,11 +55,13 @@ impl ArtifactStore for InMemoryArtifactStore {
     }
 
     async fn get(&self, artifact_ref: &ArtifactRef) -> SakhaResult<Option<Vec<u8>>> {
-        Ok(self.blobs.lock().unwrap().get(&artifact_ref.content_hash).cloned())
+        let blobs = self.blobs.lock().map_err(|_| poison_err("get"))?;
+        Ok(blobs.get(&artifact_ref.content_hash).cloned())
     }
 
     async fn delete(&self, artifact_ref: &ArtifactRef) -> SakhaResult<()> {
-        self.blobs.lock().unwrap().remove(&artifact_ref.content_hash);
+        let mut blobs = self.blobs.lock().map_err(|_| poison_err("delete"))?;
+        blobs.remove(&artifact_ref.content_hash);
         Ok(())
     }
 }

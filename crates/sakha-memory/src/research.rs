@@ -42,26 +42,30 @@ impl InMemoryResearchStore {
     }
 }
 
+/// Maps a poisoned-mutex error to a non-panicking `SakhaError`. A poisoned
+/// lock means some other task panicked while holding it; rather than
+/// propagating that panic to every future caller, surface it as a fatal
+/// (but catchable) error so normal request-handling flow never panics.
+fn poison_err(what: &str) -> SakhaError {
+    SakhaError::fatal("sakha-memory", format!("{what}: lock poisoned by a prior panic"))
+}
+
 #[async_trait]
 impl ResearchStore for InMemoryResearchStore {
     async fn upsert_source(&self, source: ResearchSourceRecord) -> SakhaResult<()> {
-        self.sources.lock().unwrap().insert(source.url.clone(), source);
+        let mut sources = self.sources.lock().map_err(|_| poison_err("upsert_source"))?;
+        sources.insert(source.url.clone(), source);
         Ok(())
     }
 
     async fn get_source(&self, url: &str) -> SakhaResult<Option<ResearchSourceRecord>> {
-        Ok(self.sources.lock().unwrap().get(url).cloned())
+        let sources = self.sources.lock().map_err(|_| poison_err("get_source"))?;
+        Ok(sources.get(url).cloned())
     }
 
     async fn list_sources_for_goal(&self, goal_id: GoalId) -> SakhaResult<Vec<ResearchSourceRecord>> {
-        Ok(self
-            .sources
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|s| s.goal_id == Some(goal_id))
-            .cloned()
-            .collect())
+        let sources = self.sources.lock().map_err(|_| poison_err("list_sources_for_goal"))?;
+        Ok(sources.values().filter(|s| s.goal_id == Some(goal_id)).cloned().collect())
     }
 }
 

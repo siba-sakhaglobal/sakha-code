@@ -145,6 +145,53 @@ mod tests {
         assert_eq!(view.selected, 0);
     }
 
+    /// Snapshot test for "Session timeline rendering", per
+    /// `crates/crate-work-breakdown.md` sakha-tui "Tests". Renders a
+    /// `SessionView` into an in-memory `TestBackend` buffer (no real
+    /// terminal needed) and asserts the buffer's text contains the
+    /// session/turn/cost content the view is responsible for drawing, so a
+    /// regression in `render`'s layout/content is caught even though the
+    /// pure state-logic tests above never call `render` at all.
+    #[test]
+    fn render_draws_header_turns_and_cost_footer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut view = SessionView::default();
+        let session = SessionRecord {
+            id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            goal_id: None,
+            status: SessionStatus::Active,
+            provider_profile: None,
+            created_at: sakha_core::time::now_utc(),
+            updated_at: sakha_core::time::now_utc(),
+        };
+        view.apply(
+            Some(session),
+            vec![turn("what is the capital of France")],
+            CostSnapshot { cost_micros: 2_500_000, input_tokens: 100, output_tokens: 50, request_count: 1 },
+        );
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                view.render(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+
+        assert!(rendered.contains("Session Timeline"), "rendered output: {rendered}");
+        assert!(rendered.contains("Active"), "rendered output: {rendered}");
+        assert!(rendered.contains("what is the capital of France"), "rendered output: {rendered}");
+        assert!(rendered.contains("ok"), "rendered output should include the turn's output text: {rendered}");
+        assert!(rendered.contains("$2.5000"), "rendered output should include formatted cost: {rendered}");
+    }
+
     #[test]
     fn header_reflects_session_status() {
         let mut view = SessionView::default();

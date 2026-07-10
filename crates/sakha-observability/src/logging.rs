@@ -87,28 +87,35 @@ impl RedactionHook for PatternRedactionHook {
 /// Applies a small built-in set of secret-shaped regexes without requiring
 /// the `regex` crate (kept dependency-light): looks for common prefixes and
 /// masks the remainder of the token.
+///
+/// Implemented as a single left-to-right scan over `text` (checking every
+/// candidate prefix at each byte position) rather than repeated whole-string
+/// `str::find` calls per prefix: the latter re-scans the remaining text from
+/// scratch for every prefix on every match, which is unbounded/pathological
+/// (effectively O(n * m) with no cap) on adversarial input such as a large
+/// string containing many near-miss prefix fragments. This scan advances by
+/// at least one byte per outer step and visits each input byte a bounded
+/// number of times (once per candidate prefix), so total work is
+/// `O(n * PREFIXES.len())` — linear in the input size.
 fn redact_builtin_patterns(text: &str) -> String {
     const PREFIXES: &[&str] = &["sk-", "AKIA", "ghp_", "xoxb-", "Bearer "];
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    'outer: while !rest.is_empty() {
-        for prefix in PREFIXES {
-            if let Some(start) = rest.find(prefix) {
-                // Copy everything up to and including the prefix start as-is,
-                // but the prefix itself gets swallowed into the redaction.
-                let before = &rest[..start];
-                out.push_str(before);
-                let after_prefix = &rest[start..];
-                let token_end = after_prefix
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(after_prefix.len());
-                out.push_str("[REDACTED]");
-                rest = &after_prefix[token_end..];
-                continue 'outer;
-            }
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let remaining = &text[i..];
+        if let Some(prefix) = PREFIXES.iter().find(|p| remaining.starts_with(**p)) {
+            let after_prefix = &remaining[prefix.len()..];
+            let token_end = after_prefix.find(|c: char| c.is_whitespace()).unwrap_or(after_prefix.len());
+            out.push_str("[REDACTED]");
+            i += prefix.len() + token_end;
+        } else {
+            // Advance by exactly one char (not necessarily one byte) so
+            // multi-byte UTF-8 sequences are copied whole.
+            let ch_len = remaining.chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&remaining[..ch_len]);
+            i += ch_len;
         }
-        out.push_str(rest);
-        break;
     }
     out
 }

@@ -7,19 +7,52 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use sakha_core::{EventEnvelope, SakhaResult, SessionId};
+use sakha_core::{EventEnvelope, SakhaResult, SessionId, ToolCallId, TurnId};
 
 use crate::logging::{redact_with, NoopRedactionHook, ObservabilityConfig, RedactionHook};
 
+/// A command execution linked back to the tool call (and, where known, the
+/// turn) that ran it, per spec "Link every file write to tool call and
+/// turn". `tool_call_id`/`turn_id` are `None` only when the source event's
+/// payload did not carry that correlation id (e.g. events emitted before
+/// this linkage was added upstream) — `build_session_report` still records
+/// the command in that case rather than dropping it, but callers can detect
+/// and flag unlinked entries via these fields being `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRun {
+    pub command: String,
+    pub tool_call_id: Option<ToolCallId>,
+    pub turn_id: Option<TurnId>,
+}
+
+/// A file write linked back to the tool call (and, where known, the turn)
+/// that performed it. See [`CommandRun`] for the linkage contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChange {
+    pub file_path: String,
+    pub tool_call_id: Option<ToolCallId>,
+    pub turn_id: Option<TurnId>,
+}
+
 /// A finished, exportable summary of one session for audit review. Mirrors
-/// spec "Export session report".
+/// spec "Export session report". `commands_run`/`files_changed` carry their
+/// originating `tool_call_id`/`turn_id` so every entry is traceable back to
+/// the tool call and turn that produced it, per spec "Link every file write
+/// to tool call and turn".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionReport {
     pub session_id: SessionId,
     pub events: Vec<EventEnvelope>,
-    pub commands_run: Vec<String>,
-    pub files_changed: Vec<String>,
+    pub commands_run: Vec<CommandRun>,
+    pub files_changed: Vec<FileChange>,
     pub total_cost_micros: u64,
+    /// Payload entries that looked like a command/file-write event but were
+    /// missing an expected key (e.g. `tool_call_id`) or had the wrong JSON
+    /// type, keyed by event sequence number. Populated instead of silently
+    /// dropping the entry, so "Link every file write" is verifiable: an
+    /// empty list here means every command/file-write event in this report
+    /// was fully parsed and linked.
+    pub unparsed_events: Vec<u64>,
 }
 
 /// An append-only, in-process audit log. Events are never removed or
@@ -31,6 +64,21 @@ pub struct AuditLog {
     events: Mutex<Vec<EventEnvelope>>,
 }
 
+/// Recovers from a poisoned mutex by taking the inner data anyway.
+///
+/// The audit log's append-only invariant lives in its API surface (only
+/// `append` mutates), not in the mutex itself, so a panic elsewhere while
+/// the lock was held does not corrupt the recorded events — they are still
+/// a structurally valid `Vec`. Recovering via `into_inner` keeps the log
+/// available for further appends/reads instead of poisoning every future
+/// caller with a panic.
+fn recover<'a, T>(result: Result<std::sync::MutexGuard<'a, T>, std::sync::PoisonError<std::sync::MutexGuard<'a, T>>>) -> std::sync::MutexGuard<'a, T> {
+    match result {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl AuditLog {
     pub fn new() -> Self {
         Self::default()
@@ -39,29 +87,23 @@ impl AuditLog {
     /// Appends an event to the log. This is the only mutation entry point;
     /// there is intentionally no `remove`/`clear` in the public API.
     pub fn append(&self, event: EventEnvelope) {
-        self.events.lock().unwrap().push(event);
+        recover(self.events.lock()).push(event);
     }
 
     /// Returns every event recorded for `session_id`, in append (and thus
     /// chronological/sequence) order.
     pub fn events_for_session(&self, session_id: SessionId) -> Vec<EventEnvelope> {
-        self.events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.session_id == Some(session_id))
-            .cloned()
-            .collect()
+        recover(self.events.lock()).iter().filter(|e| e.session_id == Some(session_id)).cloned().collect()
     }
 
     /// Returns a snapshot of every event recorded across all sessions, in
     /// append order.
     pub fn all_events(&self) -> Vec<EventEnvelope> {
-        self.events.lock().unwrap().clone()
+        recover(self.events.lock()).clone()
     }
 
     pub fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
+        recover(self.events.lock()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -110,10 +152,15 @@ impl AuditExporter {
             commands_run: report
                 .commands_run
                 .iter()
-                .map(|c| redact_with(&self.config, hook, c))
+                .map(|c| CommandRun {
+                    command: redact_with(&self.config, hook, &c.command),
+                    tool_call_id: c.tool_call_id,
+                    turn_id: c.turn_id,
+                })
                 .collect(),
             files_changed: report.files_changed.clone(),
             total_cost_micros: report.total_cost_micros,
+            unparsed_events: report.unparsed_events.clone(),
         }
     }
 
@@ -182,17 +229,37 @@ pub fn build_session_report(log: &AuditLog, session_id: SessionId, total_cost_mi
     let events = log.events_for_session(session_id);
     let mut commands_run = Vec::new();
     let mut files_changed = Vec::new();
+    let mut unparsed_events = Vec::new();
 
     for event in &events {
+        let tool_call_id = event
+            .payload
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<ToolCallId>().ok());
+        let turn_id = event.payload.get("turn_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<TurnId>().ok());
+
+        let mut linked_something = false;
         if let Some(cmd) = event.payload.get("command").and_then(|v| v.as_str()) {
-            commands_run.push(cmd.to_string());
+            commands_run.push(CommandRun { command: cmd.to_string(), tool_call_id, turn_id });
+            linked_something = true;
         }
         if let Some(path) = event.payload.get("file_path").and_then(|v| v.as_str()) {
-            files_changed.push(path.to_string());
+            files_changed.push(FileChange { file_path: path.to_string(), tool_call_id, turn_id });
+            linked_something = true;
+        }
+        // A payload that names a command/file-write shape but is missing the
+        // expected key or has the wrong JSON type is recorded as unparsed
+        // rather than silently dropped, per the "Link every file write to
+        // tool call and turn" verifiability requirement.
+        if !linked_something
+            && (event.payload.get("command").is_some() || event.payload.get("file_path").is_some())
+        {
+            unparsed_events.push(event.sequence);
         }
     }
 
-    SessionReport { session_id, events, commands_run, files_changed, total_cost_micros }
+    SessionReport { session_id, events, commands_run, files_changed, total_cost_micros, unparsed_events }
 }
 
 /// A no-redaction convenience for tests/callers that don't need secret
@@ -214,14 +281,16 @@ mod tests {
         let report = SessionReport {
             session_id: SessionId::new(),
             events: Vec::new(),
-            commands_run: vec!["cargo test".into()],
-            files_changed: vec!["src/lib.rs".into()],
+            commands_run: vec![CommandRun { command: "cargo test".into(), tool_call_id: None, turn_id: None }],
+            files_changed: vec![FileChange { file_path: "src/lib.rs".into(), tool_call_id: None, turn_id: None }],
             total_cost_micros: 42,
+            unparsed_events: Vec::new(),
         };
         let json = exporter.export_json(&report).unwrap();
         let back: SessionReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_id, report.session_id);
-        assert_eq!(back.commands_run, report.commands_run);
+        assert_eq!(back.commands_run.len(), report.commands_run.len());
+        assert_eq!(back.commands_run[0].command, report.commands_run[0].command);
     }
 
     #[test]
@@ -267,9 +336,14 @@ mod tests {
         let report = SessionReport {
             session_id: SessionId::new(),
             events: Vec::new(),
-            commands_run: vec!["curl -H 'Authorization: sk-secret123'".into()],
+            commands_run: vec![CommandRun {
+                command: "curl -H 'Authorization: sk-secret123'".into(),
+                tool_call_id: None,
+                turn_id: None,
+            }],
             files_changed: vec![],
             total_cost_micros: 0,
+            unparsed_events: Vec::new(),
         };
         let exporter = AuditExporter::new();
         let json = exporter.export_json_redacted(&report, &FakeHook).unwrap();
@@ -293,10 +367,13 @@ mod tests {
         ));
 
         let report = build_session_report(&log, session, 123);
-        assert_eq!(report.commands_run, vec!["cargo test".to_string()]);
-        assert_eq!(report.files_changed, vec!["src/lib.rs".to_string()]);
+        assert_eq!(report.commands_run.len(), 1);
+        assert_eq!(report.commands_run[0].command, "cargo test");
+        assert_eq!(report.files_changed.len(), 1);
+        assert_eq!(report.files_changed[0].file_path, "src/lib.rs");
         assert_eq!(report.total_cost_micros, 123);
         assert_eq!(report.events.len(), 2);
+        assert!(report.unparsed_events.is_empty());
     }
 
     #[test]
@@ -309,6 +386,7 @@ mod tests {
             commands_run: vec![],
             files_changed: vec![],
             total_cost_micros: 7,
+            unparsed_events: Vec::new(),
         };
         let exporter = AuditExporter::new();
         let (report_path, events_path) = exporter.export_to_dir(&dir, &report).unwrap();

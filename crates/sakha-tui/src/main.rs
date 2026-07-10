@@ -171,17 +171,47 @@ fn render(frame: &mut Frame, app: &TuiApp) {
         View::Session => app.session_view.render(frame, chunks[1]),
         View::Tools => app.tools_view.render(frame, chunks[1]),
         View::Loops => app.loops_view.render(frame, chunks[1]),
+        View::Diff | View::Provider | View::Memory | View::Research | View::Compression => {
+            render_placeholder(frame, app.active_view, chunks[1])
+        }
     }
 
     render_status_bar(frame, chunks[2]);
 }
 
+/// Renders a minimal, always-correct placeholder body for screens whose
+/// data-backed view has not landed yet (see spec `modules/13-ui-cli-tui-web-desktop.md`
+/// "TUI Screens"). Keeps the view reachable/testable via the tab bar and
+/// keymap now, rather than the screen simply not existing.
+fn render_placeholder(frame: &mut Frame, view: View, area: Rect) {
+    let block = Block::default().title(view.label()).borders(Borders::ALL);
+    let body = Paragraph::new(format!("{} view: no data source wired yet.", view.label())).block(block);
+    frame.render_widget(body, area);
+}
+
 fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let titles: Vec<Line> = ["1:Session", "2:Tools", "3:Loops"].iter().map(|t| Line::from(*t)).collect();
+    let titles: Vec<Line> = [
+        "1:Session",
+        "2:Tools",
+        "3:Loops",
+        "4:Diff",
+        "5:Provider",
+        "6:Memory",
+        "7:Research",
+        "8:Compression",
+    ]
+    .iter()
+    .map(|t| Line::from(*t))
+    .collect();
     let selected = match app.active_view {
         View::Session => 0,
         View::Tools => 1,
         View::Loops => 2,
+        View::Diff => 3,
+        View::Provider => 4,
+        View::Memory => 5,
+        View::Research => 6,
+        View::Compression => 7,
     };
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title("sakha-tui"))

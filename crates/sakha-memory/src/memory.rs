@@ -13,7 +13,7 @@ use sakha_core::{SakhaError, SakhaResult, WorkspaceId};
 use crate::db::Database;
 
 /// Category of a memory record. See spec "Memory Types".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
     ConversationHistory,
@@ -139,15 +139,24 @@ impl InMemoryMemoryStore {
     }
 }
 
+/// Maps a poisoned-mutex error to a non-panicking `SakhaError`. A poisoned
+/// lock means some other task panicked while holding it; rather than
+/// propagating that panic to every future caller, surface it as a fatal
+/// (but catchable) error so normal request-handling flow never panics.
+fn poison_err(what: &str) -> SakhaError {
+    SakhaError::fatal("sakha-memory", format!("{what}: lock poisoned by a prior panic"))
+}
+
 #[async_trait]
 impl MemoryStore for InMemoryMemoryStore {
     async fn write_memory(&self, record: MemoryRecord) -> SakhaResult<()> {
-        self.records.lock().unwrap().push(record);
+        let mut records = self.records.lock().map_err(|_| poison_err("write_memory"))?;
+        records.push(record);
         Ok(())
     }
 
     async fn search_memory(&self, query: MemoryQuery) -> SakhaResult<Vec<MemoryHit>> {
-        let records = self.records.lock().unwrap();
+        let records = self.records.lock().map_err(|_| poison_err("search_memory"))?;
         let hits = records
             .iter()
             .filter(|r| {
@@ -170,6 +179,83 @@ impl MemoryStore for InMemoryMemoryStore {
 
     async fn summarize_session(&self, _session_id: sakha_core::SessionId) -> SakhaResult<Summary> {
         Ok(Summary { text: String::new(), token_estimate: 0 })
+    }
+}
+
+/// A lightweight in-process secondary index over memory records, keyed by
+/// workspace and kind. Per spec `06-context-memory-state.md` "Storage"
+/// ("Optional vector index for semantic retrieval", "Optional Tantivy
+/// full-text index for local search"), a real vector/full-text backend can
+/// replace or wrap this later without changing the `MemoryIndex` API — this
+/// implementation covers the always-available local case: exact
+/// workspace/kind lookup without a full table scan.
+///
+/// `MemoryStore` implementations own persistence; `MemoryIndex` is a
+/// read-optimized view that callers populate explicitly (e.g. by indexing
+/// records as they're written, or by rebuilding from a `MemoryStore` search)
+/// rather than something the store maintains implicitly, keeping the write
+/// path free of extra locking/coupling.
+#[derive(Debug, Default)]
+pub struct MemoryIndex {
+    by_workspace_kind: std::collections::HashMap<(WorkspaceId, MemoryKind), Vec<MemoryRecord>>,
+}
+
+impl MemoryIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds or replaces a record in the index, keyed by its own id (a
+    /// re-indexed record with the same id replaces the previous entry).
+    pub fn index(&mut self, record: MemoryRecord) {
+        let key = (record.workspace_id, record.kind);
+        let bucket = self.by_workspace_kind.entry(key).or_default();
+        if let Some(existing) = bucket.iter_mut().find(|r| r.id == record.id) {
+            *existing = record;
+        } else {
+            bucket.push(record);
+        }
+    }
+
+    /// Builds an index from a batch of records, e.g. the result of a
+    /// `MemoryStore::search_memory` call.
+    pub fn from_records(records: impl IntoIterator<Item = MemoryRecord>) -> Self {
+        let mut index = Self::new();
+        for record in records {
+            index.index(record);
+        }
+        index
+    }
+
+    /// Returns every indexed record for `(workspace_id, kind)`, in insertion
+    /// order. Empty (not an error) when nothing has been indexed for that
+    /// key yet.
+    pub fn lookup(&self, workspace_id: WorkspaceId, kind: MemoryKind) -> &[MemoryRecord] {
+        self.by_workspace_kind.get(&(workspace_id, kind)).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Total number of indexed records across all workspace/kind buckets.
+    pub fn len(&self) -> usize {
+        self.by_workspace_kind.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Removes a record from the index by id, returning `true` if it was
+    /// present.
+    pub fn remove(&mut self, workspace_id: WorkspaceId, kind: MemoryKind, id: uuid::Uuid) -> bool {
+        let Some(bucket) = self.by_workspace_kind.get_mut(&(workspace_id, kind)) else {
+            return false;
+        };
+        let before = bucket.len();
+        bucket.retain(|r| r.id != id);
+        let removed = bucket.len() != before;
+        if bucket.is_empty() {
+            self.by_workspace_kind.remove(&(workspace_id, kind));
+        }
+        removed
     }
 }
 
@@ -343,5 +429,46 @@ mod sqlite_tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].record.text.contains("rust"));
+    }
+
+    #[test]
+    fn memory_index_looks_up_by_workspace_and_kind() {
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let mut index = MemoryIndex::new();
+        index.index(MemoryRecord::new(ws_a, MemoryKind::ProjectFact, "fact a"));
+        index.index(MemoryRecord::new(ws_a, MemoryKind::Decision, "decision a"));
+        index.index(MemoryRecord::new(ws_b, MemoryKind::ProjectFact, "fact b"));
+
+        assert_eq!(index.lookup(ws_a, MemoryKind::ProjectFact).len(), 1);
+        assert_eq!(index.lookup(ws_a, MemoryKind::ProjectFact)[0].text, "fact a");
+        assert_eq!(index.lookup(ws_a, MemoryKind::Decision).len(), 1);
+        assert_eq!(index.lookup(ws_b, MemoryKind::ProjectFact).len(), 1);
+        assert!(index.lookup(ws_b, MemoryKind::Decision).is_empty());
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn memory_index_reindexing_same_id_replaces_entry() {
+        let ws = WorkspaceId::new();
+        let mut record = MemoryRecord::new(ws, MemoryKind::ProjectFact, "v1");
+        let mut index = MemoryIndex::new();
+        index.index(record.clone());
+        record.text = "v2".into();
+        index.index(record.clone());
+
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.lookup(ws, MemoryKind::ProjectFact)[0].text, "v2");
+    }
+
+    #[test]
+    fn memory_index_remove_drops_record_and_empty_bucket() {
+        let ws = WorkspaceId::new();
+        let record = MemoryRecord::new(ws, MemoryKind::ProjectFact, "fact");
+        let mut index = MemoryIndex::new();
+        index.index(record.clone());
+        assert!(index.remove(ws, MemoryKind::ProjectFact, record.id));
+        assert!(index.is_empty());
+        assert!(!index.remove(ws, MemoryKind::ProjectFact, record.id));
     }
 }

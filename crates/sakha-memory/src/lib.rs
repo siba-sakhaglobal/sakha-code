@@ -18,7 +18,7 @@ pub use artifact_store::{ArtifactStore, InMemoryArtifactStore, SqliteArtifactSto
 pub use db::Database;
 pub use handoff::{HandoffArtifact, HandoffStore, InMemoryHandoffStore, SqliteHandoffStore};
 pub use memory::{
-    InMemoryMemoryStore, MemoryHit, MemoryKind, MemoryQuery, MemoryRecord, MemoryStore,
+    InMemoryMemoryStore, MemoryHit, MemoryIndex, MemoryKind, MemoryQuery, MemoryRecord, MemoryStore,
     RelevanceScore, SqliteMemoryStore, Summary,
 };
 pub use migrations::{all_migrations, current_version, run_migrations, Migration};

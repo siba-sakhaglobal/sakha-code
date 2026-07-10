@@ -91,38 +91,44 @@ impl InMemorySessionStore {
     }
 }
 
+/// Maps a poisoned-mutex error to a non-panicking `SakhaError`. A poisoned
+/// lock means some other task panicked while holding it; rather than
+/// propagating that panic to every future caller, surface it as a fatal
+/// (but catchable) error so normal request-handling flow never panics.
+fn poison_err(source_module: &'static str, what: &str) -> SakhaError {
+    SakhaError::fatal(source_module, format!("{what}: lock poisoned by a prior panic"))
+}
+
 #[async_trait]
 impl SessionStore for InMemorySessionStore {
     async fn create_session(&self, session: SessionRecord) -> SakhaResult<()> {
-        self.sessions.lock().unwrap().insert(session.id, session);
+        let mut sessions = self.sessions.lock().map_err(|_| poison_err("sakha-memory", "create_session"))?;
+        sessions.insert(session.id, session);
         Ok(())
     }
 
     async fn get_session(&self, id: SessionId) -> SakhaResult<Option<SessionRecord>> {
-        Ok(self.sessions.lock().unwrap().get(&id).cloned())
+        let sessions = self.sessions.lock().map_err(|_| poison_err("sakha-memory", "get_session"))?;
+        Ok(sessions.get(&id).cloned())
     }
 
     async fn update_session_status(&self, id: SessionId, status: SessionStatus) -> SakhaResult<()> {
-        if let Some(session) = self.sessions.lock().unwrap().get_mut(&id) {
+        let mut sessions = self.sessions.lock().map_err(|_| poison_err("sakha-memory", "update_session_status"))?;
+        if let Some(session) = sessions.get_mut(&id) {
             session.status = status;
         }
         Ok(())
     }
 
     async fn append_turn(&self, turn: TurnRecord) -> SakhaResult<()> {
-        self.turns.lock().unwrap().push(turn);
+        let mut turns = self.turns.lock().map_err(|_| poison_err("sakha-memory", "append_turn"))?;
+        turns.push(turn);
         Ok(())
     }
 
     async fn list_turns(&self, session_id: SessionId) -> SakhaResult<Vec<TurnRecord>> {
-        Ok(self
-            .turns
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|t| t.session_id == session_id)
-            .cloned()
-            .collect())
+        let turns = self.turns.lock().map_err(|_| poison_err("sakha-memory", "list_turns"))?;
+        Ok(turns.iter().filter(|t| t.session_id == session_id).cloned().collect())
     }
 }
 

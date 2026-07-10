@@ -69,15 +69,25 @@ impl InMemoryHandoffStore {
     }
 }
 
+/// Maps a poisoned-mutex error to a non-panicking `SakhaError`. A poisoned
+/// lock means some other task panicked while holding it; rather than
+/// propagating that panic to every future caller, surface it as a fatal
+/// (but catchable) error so normal request-handling flow never panics.
+fn poison_err(what: &str) -> SakhaError {
+    SakhaError::fatal("sakha-memory", format!("{what}: lock poisoned by a prior panic"))
+}
+
 #[async_trait]
 impl HandoffStore for InMemoryHandoffStore {
     async fn write_handoff(&self, goal_id: GoalId, handoff: HandoffArtifact) -> SakhaResult<()> {
-        self.handoffs.lock().unwrap().insert(goal_id, handoff);
+        let mut handoffs = self.handoffs.lock().map_err(|_| poison_err("write_handoff"))?;
+        handoffs.insert(goal_id, handoff);
         Ok(())
     }
 
     async fn load_handoff(&self, goal_id: GoalId) -> SakhaResult<Option<HandoffArtifact>> {
-        Ok(self.handoffs.lock().unwrap().get(&goal_id).cloned())
+        let handoffs = self.handoffs.lock().map_err(|_| poison_err("load_handoff"))?;
+        Ok(handoffs.get(&goal_id).cloned())
     }
 }
 
