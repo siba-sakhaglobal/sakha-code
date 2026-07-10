@@ -239,7 +239,11 @@ impl Agent {
                     .await;
             }
 
+            // Echo the assistant's tool calls back into history — required by
+            // the OpenAI chat format for providers to match the Tool-role
+            // results that follow (Gemini's compat layer 400s without it).
             messages.push(ModelMessage {
+                tool_calls: response.tool_calls.clone(),
                 role: MessageRole::Assistant,
                 content: response.text.clone(),
                 tool_call_id: None,
@@ -330,7 +334,7 @@ impl Agent {
                         self.record_tool_effects(&call.name, &result);
                         let action = self.deps.policy.on_tool_result(&result);
                         let summary_text = summarize_result(&result);
-                        messages.push(ModelMessage {
+                        messages.push(ModelMessage { tool_calls: Vec::new(),
                             role: MessageRole::Tool,
                             content: summary_text,
                             tool_call_id: Some(call.id.clone()),
@@ -453,13 +457,13 @@ impl Agent {
         let assembled = self.deps.prompt_assembler.assemble(&prompt_request)?;
 
         Ok(vec![
-            ModelMessage {
+            ModelMessage { tool_calls: Vec::new(),
                 role: MessageRole::System,
                 content: assembled.render(),
                 tool_call_id: None,
                 name: None,
             },
-            ModelMessage {
+            ModelMessage { tool_calls: Vec::new(),
                 role: MessageRole::User,
                 content: user_input.to_string(),
                 tool_call_id: None,
@@ -516,7 +520,7 @@ impl Agent {
 }
 
 fn tool_error_message(call_id: &str, tool_name: &str, message: String) -> ModelMessage {
-    ModelMessage {
+    ModelMessage { tool_calls: Vec::new(),
         role: MessageRole::Tool,
         content: format!("error: {message}"),
         tool_call_id: Some(call_id.to_string()),
@@ -686,7 +690,7 @@ mod tests {
         ModelResponse {
             request_id: sakha_core::ModelRequestId::new(),
             text: String::new(),
-            tool_calls: vec![sakha_provider::AssembledToolCall {
+            tool_calls: vec![sakha_provider::AssembledToolCall { extra_content: None,
                 id: "call_1".into(),
                 name: name.into(),
                 arguments_json: args.into(),
@@ -738,7 +742,7 @@ mod tests {
         // panic + audit-visible effect).
         let dir = tempfile::tempdir().unwrap();
         let provider = provider_with_events(vec![
-            sakha_provider::ModelEvent::ToolCallDelta(sakha_provider::ToolCallDelta {
+            sakha_provider::ModelEvent::ToolCallDelta(sakha_provider::ToolCallDelta { extra_content: None,
                 index: 0,
                 id: Some("call_1".into()),
                 name: Some("echo".into()),
@@ -879,12 +883,12 @@ mod tests {
             request_id: sakha_core::ModelRequestId::new(),
             text: String::new(),
             tool_calls: vec![
-                sakha_provider::AssembledToolCall {
+                sakha_provider::AssembledToolCall { extra_content: None,
                     id: "call_1".into(),
                     name: "echo".into(),
                     arguments_json: r#"{"value":"a"}"#.into(),
                 },
-                sakha_provider::AssembledToolCall {
+                sakha_provider::AssembledToolCall { extra_content: None,
                     id: "call_2".into(),
                     name: "echo".into(),
                     arguments_json: r#"{"value":"b"}"#.into(),

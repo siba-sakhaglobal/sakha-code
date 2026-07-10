@@ -116,7 +116,7 @@ async fn chat_async(args: ChatArgs, input: &mut impl BufRead, out: &mut impl Wri
         }
 
         let mut request = ModelRequest::new(config.provider.model.clone());
-        request.messages.push(ModelMessage {
+        request.messages.push(ModelMessage { tool_calls: Vec::new(),
             role: MessageRole::User,
             content: line.to_string(),
             tool_call_id: None,

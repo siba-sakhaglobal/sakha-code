@@ -70,7 +70,7 @@ mod tests {
         use sakha_provider::ToolCallDelta;
 
         let mut interpreter = DefaultToolCallInterpreter::default();
-        interpreter.assemble(ToolCallDelta {
+        interpreter.assemble(ToolCallDelta { extra_content: None,
             index: 0,
             id: Some("call_1".into()),
             name: Some("file.read".into()),

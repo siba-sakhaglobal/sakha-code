@@ -86,7 +86,7 @@ async fn run_async(args: RunArgs) -> i32 {
         .await;
 
     let mut request = ModelRequest::new(config.provider.model.clone());
-    request.messages.push(ModelMessage {
+    request.messages.push(ModelMessage { tool_calls: Vec::new(),
         role: MessageRole::User,
         content: args.prompt.clone(),
         tool_call_id: None,

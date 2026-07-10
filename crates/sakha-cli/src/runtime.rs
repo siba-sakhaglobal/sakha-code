@@ -203,10 +203,18 @@ pub async fn run_agent_turn(
             break;
         }
 
-        // Record the assistant's turn (including the tool-call text, if any)
-        // before appending tool results, so the next round's context is
-        // faithful to what the model actually said/asked for.
-        request.messages.push(ModelMessage { role: MessageRole::Assistant, content: text, tool_call_id: None, name: None });
+        // Record the assistant's turn — including the tool calls it made —
+        // before appending tool results. Echoing `tool_calls` back is
+        // required by the OpenAI chat format so the provider can match the
+        // following Tool-role messages by id (Gemini's compat layer 400s
+        // without it: "function_response.name cannot be empty").
+        request.messages.push(ModelMessage {
+            tool_calls: tool_calls.clone(),
+            role: MessageRole::Assistant,
+            content: text,
+            tool_call_id: None,
+            name: None,
+        });
 
         let context = ToolContext::new(".");
         for call in &tool_calls {
@@ -222,7 +230,10 @@ pub async fn run_agent_turn(
                 Err(err) => (format!("unknown tool: {err}"), false),
             };
             on_tool_call(&call.name, succeeded);
-            request.messages.push(ModelMessage {
+            if !succeeded && std::env::var_os("SAKHA_DEBUG_BODY").is_some() {
+                eprintln!("[sakha] tool {} failed: {output_text}", call.name);
+            }
+            request.messages.push(ModelMessage { tool_calls: Vec::new(),
                 role: MessageRole::Tool,
                 content: output_text,
                 tool_call_id: Some(call.id.clone()),
@@ -410,7 +421,7 @@ mod tests {
 
         let provider = ScriptedRoundsProvider::new(vec![
             vec![
-                ModelEvent::ToolCallDelta(sakha_provider::ToolCallDelta {
+                ModelEvent::ToolCallDelta(sakha_provider::ToolCallDelta { extra_content: None,
                     index: 0,
                     id: Some("call_1".into()),
                     name: Some("file.write".into()),
@@ -447,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn run_agent_turn_bounds_rounds_when_model_never_stops_calling_tools() {
         let always_calls_tool = vec![
-            ModelEvent::ToolCallDelta(sakha_provider::ToolCallDelta {
+            ModelEvent::ToolCallDelta(sakha_provider::ToolCallDelta { extra_content: None,
                 index: 0,
                 id: Some("call_x".into()),
                 name: Some("git.status".into()),

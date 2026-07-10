@@ -10,7 +10,7 @@ use sakha_core::{ModelRequestId, SakhaError, SakhaResult};
 
 use crate::capabilities::ProviderCapabilities;
 use crate::cost::UsageRecord;
-use crate::tool_calls::ToolCallDelta;
+use crate::tool_calls::{AssembledToolCall, ToolCallDelta};
 
 /// A single message in a provider-neutral conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +20,13 @@ pub struct ModelMessage {
     /// Present when `role == Tool`: which tool call this message answers.
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
+    /// Present when `role == Assistant` and the model requested tool calls.
+    /// The OpenAI chat format requires the assistant turn to echo its
+    /// `tool_calls` back in subsequent requests so providers can match the
+    /// following `Tool`-role results by id — some (e.g. Gemini's
+    /// OpenAI-compat layer) hard-reject the request without it.
+    #[serde(default)]
+    pub tool_calls: Vec<AssembledToolCall>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,13 +337,13 @@ mod mock_tests {
     #[tokio::test]
     async fn mock_provider_complete_assembles_tool_calls_from_deltas() {
         let client = MockProviderClient::new(vec![
-            ModelEvent::ToolCallDelta(ToolCallDelta {
+            ModelEvent::ToolCallDelta(ToolCallDelta { extra_content: None,
                 index: 0,
                 id: Some("call_1".into()),
                 name: Some("read_file".into()),
                 arguments_fragment: "{\"path\":".into(),
             }),
-            ModelEvent::ToolCallDelta(ToolCallDelta {
+            ModelEvent::ToolCallDelta(ToolCallDelta { extra_content: None,
                 index: 0,
                 id: None,
                 name: None,

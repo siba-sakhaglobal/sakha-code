@@ -86,6 +86,27 @@ impl OpenAiCompatibleClient {
             if let Some(name) = &m.name {
                 msg["name"] = serde_json::Value::String(name.clone());
             }
+            if !m.tool_calls.is_empty() {
+                msg["tool_calls"] = serde_json::Value::Array(
+                    m.tool_calls
+                        .iter()
+                        .map(|c| {
+                            let mut call = serde_json::json!({
+                                "id": c.id,
+                                "type": "function",
+                                "function": { "name": c.name, "arguments": c.arguments_json },
+                            });
+                            // Echo provider-opaque payloads verbatim (e.g.
+                            // Gemini thought signatures) — required for the
+                            // follow-up request to be accepted.
+                            if let Some(extra) = &c.extra_content {
+                                call["extra_content"] = extra.clone();
+                            }
+                            call
+                        })
+                        .collect(),
+                );
+            }
             messages.push(msg);
         }
 
@@ -363,6 +384,7 @@ fn parse_chunk_json(data: &str) -> Vec<ModelEvent> {
                         id,
                         name,
                         arguments_fragment,
+                        extra_content: tc.get("extra_content").filter(|v| !v.is_null()).cloned(),
                     }));
                 }
             }
@@ -406,6 +428,12 @@ impl ProviderClient for OpenAiCompatibleClient {
     async fn stream(&self, request: ModelRequest) -> SakhaResult<ModelEventStream> {
         let mut body = self.build_request_body(&request);
         body["stream"] = serde_json::Value::Bool(true);
+
+        // Troubleshooting aid: dump the outgoing body (no secrets live in the
+        // body; auth is header-only and already redacted from logs).
+        if std::env::var_os("SAKHA_DEBUG_BODY").is_some() {
+            eprintln!("[sakha-provider] request body: {body}");
+        }
 
         let response = self.send_with_retry(&body).await?;
 
@@ -563,7 +591,7 @@ mod tests {
         let profile = ProviderProfile::openai_compatible("test", "https://example.com", "gpt-test");
         let client = OpenAiCompatibleClient::new(profile);
         let mut request = ModelRequest::new("gpt-test");
-        request.messages.push(ModelMessage {
+        request.messages.push(ModelMessage { tool_calls: Vec::new(),
             role: MessageRole::User,
             content: "hi".into(),
             tool_call_id: None,
