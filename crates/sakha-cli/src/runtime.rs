@@ -71,9 +71,63 @@ fn resolve_key_into_env(config: &SakhaConfig, backend: &dyn SecretBackend) {
 }
 
 /// Builds the default tool registry, used by `run`/`chat` to describe
-/// available tools to the model and (in future) execute them.
+/// available tools to the model and (in future) execute them. Always
+/// includes `web.search`/`web.fetch` (see `sakha_research::web_tools`) so
+/// the agent loop can search/fetch the web regardless of whether any search
+/// backend env var happens to be configured — the tools themselves return a
+/// clear `invalid_input` error at call time when no backend is available.
 pub fn build_tool_registry() -> ToolRegistry {
-    sakha_tools::default_registry()
+    let mut registry = sakha_tools::default_registry();
+    for tool in sakha_research::web_tools() {
+        registry.register(tool);
+    }
+    registry
+}
+
+/// Builds a `SearchPool` honoring `config.search.backends` (a priority
+/// override) if set, falling back to
+/// `sakha_research::DEFAULT_BACKEND_ORDER` otherwise. Backend ids not
+/// recognized are ignored (typo-tolerant: an unknown id just never
+/// contributes a backend rather than erroring the whole pool). Used by the
+/// dedicated `sakha search`/`sakha search-backends` commands, which need
+/// config-driven priority ordering distinct from the tool-registry default.
+pub fn build_search_pool(config: &crate::config::SakhaConfig) -> sakha_research::SearchPool {
+    use sakha_research::{BraveBackend, ExaBackend, FirecrawlBackend, SearchBackend, SearxngBackend, SerpApiBackend, SerperBackend, TavilyBackend};
+
+    let mut all: Vec<Box<dyn SearchBackend>> = vec![
+        Box::new(FirecrawlBackend::new()),
+        Box::new(BraveBackend::new()),
+        Box::new(TavilyBackend::new()),
+        Box::new(SerperBackend::new()),
+        Box::new(SerpApiBackend::new()),
+        Box::new(ExaBackend::new()),
+        Box::new(SearxngBackend::new()),
+    ];
+
+    let order: Vec<String> = config
+        .search
+        .backends
+        .clone()
+        .unwrap_or_else(|| sakha_research::DEFAULT_BACKEND_ORDER.iter().map(|s| s.to_string()).collect());
+
+    let mut ordered: Vec<Box<dyn SearchBackend>> = Vec::with_capacity(all.len());
+    for id in &order {
+        if let Some(pos) = all.iter().position(|b| b.id() == id.as_str()) {
+            ordered.push(all.remove(pos));
+        }
+    }
+    // Any backend not named in the override still gets appended (after the
+    // configured priority ones) rather than silently dropped, so switching
+    // priority order never removes a backend's availability entirely.
+    ordered.extend(all);
+
+    sakha_research::SearchPool::new(ordered)
+}
+
+/// Builds a `FetchPool` honoring `config.search.fetch_max_chars` as the
+/// default cap (callers may still override per-call).
+pub fn build_fetch_pool() -> sakha_research::FetchPool {
+    sakha_research::FetchPool::new()
 }
 
 /// Builds the `SessionStore` `run`/`chat`/`session`/`loops` commands share:

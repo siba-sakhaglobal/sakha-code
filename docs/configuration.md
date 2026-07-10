@@ -219,6 +219,55 @@ sakha config set custom_settings.debug true
 
 These are stored exactly as provided (with type inference: booleans, integers, floats parsed; strings otherwise).
 
+### `[search]` – Web Search & Fetch Tool Configuration
+
+Configures the `web.search`/`web.fetch` agent tools and the `sakha
+search`/`sakha fetch`/`sakha search-backends` CLI commands. See
+[Web Search & Fetch](./web-search.md) for the full picture (how the backend
+pool and quota failover work, every backend's env var and key portal URL).
+Entirely optional — an absent `[search]` section behaves exactly like the
+example below.
+
+```toml
+[search]
+backends = ["brave", "firecrawl", "tavily"]
+max_results = 5
+fetch_max_chars = 12000
+```
+
+#### `search.backends`
+
+**Type**: Array of strings, or omitted
+**Default**: `None` (uses the built-in priority order: `firecrawl`, `brave`, `tavily`, `serper`, `serpapi`, `exa`, `searxng`)
+**Required**: No
+
+Overrides which backends `web.search`/`sakha search` try, and in what
+order. Unknown ids are ignored rather than erroring; any backend not named
+here is still appended after the configured ones, so overriding priority
+never removes a backend's availability entirely.
+
+#### `search.max_results`
+
+**Type**: Integer
+**Default**: `5`
+**Required**: No
+
+Default hit count for `web.search` when the tool call/CLI flag doesn't
+specify `limit`/`--limit`. Backends generally cap this at 10.
+
+#### `search.fetch_max_chars`
+
+**Type**: Integer
+**Default**: `12000`
+**Required**: No
+
+Default character cap for `web.fetch`/`sakha fetch` output. Content beyond
+this is truncated with a `[truncated]` marker appended.
+
+Actual backend credentials (`FIRECRAWL_API_KEY`, `BRAVE_API_KEY`, etc.) are
+**not** part of this config section — like provider keys, they live only in
+environment variables or `.env` files, never in `config.toml`.
+
 ## Complete Example Configs
 
 ### Minimal Config (Mock Provider, In-Memory Sessions)
@@ -357,12 +406,23 @@ pub struct ProviderConfig {
 }
 ```
 
+### `SearchConfig` Struct
+
+```rust
+pub struct SearchConfig {
+    pub backends: Option<Vec<String>>,          // Default: None (built-in priority order)
+    pub max_results: u32,                       // Default: 5
+    pub fetch_max_chars: usize,                 // Default: 12000
+}
+```
+
 ### `SakhaConfig` Struct (Top-Level)
 
 ```rust
 pub struct SakhaConfig {
     pub provider: ProviderConfig,
     pub db_path: Option<String>,                // Default: None (in-memory store)
+    pub search: SearchConfig,                   // Default: SearchConfig::default()
     pub extra: toml::value::Table,              // Catch-all for custom keys
 }
 ```
@@ -510,5 +570,6 @@ Prior in-memory sessions are not migrated (they were ephemeral).
 ## See Also
 
 - [Getting Started](./getting-started.md) – Tutorial and first-run guide
+- [Web Search & Fetch](./web-search.md) – `[search]` backend pool, quota failover, `sakha search`/`sakha fetch`
 - `sakha config --help` – Command-line help
 - `sakha config get <key> --output json` – Machine-readable output

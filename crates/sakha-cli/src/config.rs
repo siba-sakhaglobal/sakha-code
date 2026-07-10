@@ -62,6 +62,38 @@ impl Default for ProviderConfig {
     }
 }
 
+/// Web search/fetch tool-layer settings (`web.search`/`web.fetch` and the
+/// `sakha search`/`sakha fetch` CLI commands). See `docs/web-search.md`.
+/// Absent `[search]` section = every field falls back to its default, so
+/// existing configs written before this section existed keep parsing
+/// unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Backend priority override, e.g. `["brave", "firecrawl"]`. `None`
+    /// means use the built-in default order (see
+    /// `sakha_research::DEFAULT_BACKEND_ORDER`).
+    #[serde(default)]
+    pub backends: Option<Vec<String>>,
+    #[serde(default = "default_max_results")]
+    pub max_results: u32,
+    #[serde(default = "default_fetch_max_chars")]
+    pub fetch_max_chars: usize,
+}
+
+fn default_max_results() -> u32 {
+    5
+}
+
+fn default_fetch_max_chars() -> usize {
+    12_000
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { backends: None, max_results: default_max_results(), fetch_max_chars: default_fetch_max_chars() }
+    }
+}
+
 /// Top-level on-disk config shape, `~/.sakha/config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SakhaConfig {
@@ -70,6 +102,9 @@ pub struct SakhaConfig {
     /// SQLite database path for session/memory/handoff/research/artifact
     /// stores. `None` means use the in-memory store (non-durable).
     pub db_path: Option<String>,
+    /// Web search/fetch tool settings. Absent section = all defaults.
+    #[serde(default)]
+    pub search: SearchConfig,
     /// Free-form additional keys, so `config set some.custom.key value`
     /// never fails even for keys this struct doesn't model explicitly.
     #[serde(flatten)]
@@ -252,5 +287,41 @@ mod tests {
         save_config(&path, &config).unwrap();
         let loaded = load_config(&path).unwrap();
         assert_eq!(loaded.provider.model, "custom-model");
+    }
+
+    #[test]
+    fn search_config_defaults_when_section_absent() {
+        let toml_src = "[provider]\nselection = \"mock\"\n";
+        let config: SakhaConfig = toml::from_str(toml_src).unwrap();
+        assert!(config.search.backends.is_none());
+        assert_eq!(config.search.max_results, 5);
+        assert_eq!(config.search.fetch_max_chars, 12_000);
+    }
+
+    #[test]
+    fn search_config_parses_backend_priority_override() {
+        let toml_src = r#"
+[search]
+backends = ["brave", "firecrawl"]
+max_results = 3
+fetch_max_chars = 8000
+"#;
+        let config: SakhaConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.search.backends, Some(vec!["brave".to_string(), "firecrawl".to_string()]));
+        assert_eq!(config.search.max_results, 3);
+        assert_eq!(config.search.fetch_max_chars, 8000);
+    }
+
+    #[test]
+    fn search_config_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = SakhaConfig::default();
+        config.search.backends = Some(vec!["tavily".to_string()]);
+        config.search.max_results = 7;
+        save_config(&path, &config).unwrap();
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.search.backends, Some(vec!["tavily".to_string()]));
+        assert_eq!(loaded.search.max_results, 7);
     }
 }

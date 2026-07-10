@@ -5,24 +5,35 @@
 //! `crates/crate-work-breakdown.md`. Search/fetch go behind traits with
 //! `Null*`/`Mock*` fallbacks so tests never require live network access.
 
+pub mod backends;
 pub mod compress;
 pub mod evidence;
 pub mod extract;
 pub mod fetch;
+pub mod fetch_pool;
 pub mod injection_filter;
+pub mod pool;
 pub mod scoring;
 pub mod search;
+pub mod web_tools;
 
+pub use backends::{
+    BraveBackend, ExaBackend, FirecrawlBackend, SearchBackend, SearchHit, SerpApiBackend, SearxngBackend,
+    SerperBackend, TavilyBackend,
+};
 pub use compress::{compress_document, compress_documents, default_compressor, CompressedDocument};
 pub use evidence::{Citation, EvidencePack};
 pub use extract::{ExtractedDocument, Extractor, Html2TextExtractor, PlainTextExtractor};
 pub use fetch::{FetchRequest, FetchedPage, MockPageFetcher, NullPageFetcher, PageFetcher, ReqwestPageFetcher};
+pub use fetch_pool::{sanitize_and_truncate, FetchOutcome, FetchPool, DEFAULT_MAX_CHARS};
 pub use injection_filter::{InjectionFilter, InjectionScanResult};
+pub use pool::{BackendStatus, PoolSearchResult, SearchPool, DEFAULT_BACKEND_ORDER, DEFAULT_COOLDOWN};
 pub use scoring::{SourceScore, SourceScorer};
 pub use search::{
     dedupe_results, plan_queries, HttpSearchClient, MockSearchClient, NullSearchClient, SearchClient,
     SearchEndpointConfig, SearchEndpointKind, SearchPlan, SearchProvider, SearchQuery, SearchResult,
 };
+pub use web_tools::web_tools;
 
 use serde::{Deserialize, Serialize};
 

@@ -18,6 +18,7 @@ sakha-provider = { workspace = true }
 sakha-security = { workspace = true }
 sakha-mcp = { workspace = true }
 sakha-observability = { workspace = true }
+sakha-research = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }

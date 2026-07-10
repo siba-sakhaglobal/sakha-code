@@ -24,6 +24,7 @@ use commands::mcp::McpAddArgs;
 use commands::memory::MemorySearchArgs;
 use commands::providers::{ProvidersCatalogArgs, ProvidersListArgs, ProvidersUseArgs};
 use commands::run::RunArgs;
+use commands::search::{FetchArgs, SearchArgs, SearchBackendsArgs};
 use commands::session::SessionCommand;
 use commands::tools::ToolsListArgs;
 use output::OutputFormat;
@@ -92,6 +93,13 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
+    /// Search the web (cheap — snippets only). See `sakha fetch` to pull a
+    /// full page afterwards.
+    Search(SearchArgs),
+    /// Fetch one URL as clean markdown.
+    Fetch(FetchArgs),
+    /// List web search backends: configured?, cooling down?, key portal URL.
+    SearchBackends(SearchBackendsArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -173,6 +181,9 @@ fn main() {
         },
         Command::Daemon(cmd) => commands::daemon::execute(cmd),
         Command::Doctor { output } => commands::doctor::execute(output),
+        Command::Search(args) => commands::search::execute_search(args),
+        Command::Fetch(args) => commands::search::execute_fetch(args),
+        Command::SearchBackends(args) => commands::search::execute_search_backends(args),
     };
 
     std::process::exit(exit_code);
@@ -330,5 +341,32 @@ mod tests {
             Command::Run(args) => assert_eq!(args.output, OutputFormat::Json),
             _ => panic!("expected Run command"),
         }
+    }
+
+    #[test]
+    fn search_command_parses_query_and_limit() {
+        let cli = Cli::try_parse_from(["sakha", "search", "rust tokio tutorial", "--limit", "3"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert_eq!(args.query, "rust tokio tutorial");
+                assert_eq!(args.limit, 3);
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn fetch_command_parses_url() {
+        let cli = Cli::try_parse_from(["sakha", "fetch", "https://example.com"]).unwrap();
+        match cli.command {
+            Command::Fetch(args) => assert_eq!(args.url, "https://example.com"),
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn search_backends_command_parses() {
+        let cli = Cli::try_parse_from(["sakha", "search-backends"]).unwrap();
+        assert!(matches!(cli.command, Command::SearchBackends(_)));
     }
 }
