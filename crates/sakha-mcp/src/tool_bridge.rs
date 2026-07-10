@@ -12,7 +12,7 @@ use sakha_tools::{
     ToolPermissionSpec, ToolPlan, ToolResult, ToolSpec, ToolSummary, ValidatedInput,
 };
 
-use crate::client::{McpConnection, McpToolDescriptor};
+use crate::client::{McpConnection, McpResourceDescriptor, McpToolDescriptor};
 use crate::trust::{TrustLevel, TrustPolicy};
 
 /// Builds the namespaced tool name Sakha uses for a given MCP server/tool
@@ -57,7 +57,7 @@ impl McpToolBridge {
             .into_iter()
             .map(|t| {
                 let spec = spec_for(server_name, &t);
-                Arc::new(McpProxyTool { server_name: server_name.to_string(), mcp_tool_name: t.name, spec, connection: connection.clone() })
+                Arc::new(McpToolProxy { server_name: server_name.to_string(), mcp_tool_name: t.name, spec, connection: connection.clone() })
                     as Arc<dyn Tool>
             })
             .collect())
@@ -83,7 +83,7 @@ fn spec_for(server_name: &str, t: &McpToolDescriptor) -> ToolSpec {
 
 /// A `sakha-tools::Tool` implementation that proxies calls to a single MCP
 /// tool over a live `McpConnection`.
-pub struct McpProxyTool {
+pub struct McpToolProxy {
     pub server_name: String,
     pub mcp_tool_name: String,
     pub spec: ToolSpec,
@@ -91,7 +91,7 @@ pub struct McpProxyTool {
 }
 
 #[async_trait]
-impl Tool for McpProxyTool {
+impl Tool for McpToolProxy {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }
@@ -124,6 +124,122 @@ impl Tool for McpProxyTool {
                 "mcp.{}.{} failed: {}",
                 self.server_name,
                 self.mcp_tool_name,
+                result.error_message.clone().unwrap_or_default()
+            ),
+        };
+        ToolSummary { text, truncated: false }
+    }
+}
+
+/// Builds the namespaced tool name Sakha uses to read a given MCP resource:
+/// `mcp.<server>.resource.<slug>`, where `slug` is the resource URI with
+/// characters outside `[A-Za-z0-9._-]` replaced by `_` so it is safe to use
+/// as a `ToolName` segment.
+pub fn namespaced_resource_tool_name(server_name: &str, uri: &str) -> String {
+    let slug: String = uri
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    format!("mcp.{server_name}.resource.{slug}")
+}
+
+/// Bridges discovered MCP resources into `sakha-tools` so a model can read
+/// them the same way it calls tools (spec "Main Structs": `McpResourceProxy`;
+/// "Implementation Tasks": "Implement resource proxy"). Mirrors
+/// `McpToolBridge` but for `resources/read` instead of `tools/call`.
+pub struct McpResourceProxy;
+
+impl McpResourceProxy {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Bridges `resources` from `server_name` into live, executable `Tool`s
+    /// (one per resource, taking no input and returning the resource
+    /// content), gated by `trust_policy` against `server_trust` exactly like
+    /// `McpToolBridge::bridge_executable`.
+    pub fn bridge_executable(
+        &self,
+        server_name: &str,
+        server_trust: TrustLevel,
+        trust_policy: &TrustPolicy,
+        connection: Arc<McpConnection>,
+        resources: Vec<McpResourceDescriptor>,
+    ) -> SakhaResult<Vec<Arc<dyn Tool>>> {
+        if !trust_policy.allows(server_trust) {
+            return Err(SakhaError::permission(
+                "sakha-mcp",
+                format!("MCP server '{server_name}' trust level {server_trust:?} is below policy minimum"),
+            ));
+        }
+        Ok(resources
+            .into_iter()
+            .map(|r| {
+                let name = ToolName::new(namespaced_resource_tool_name(server_name, &r.uri));
+                let spec = ToolSpec {
+                    name,
+                    description: format!("Read MCP resource '{}' ({}) from server '{server_name}'", r.name, r.uri),
+                    input_schema: ToolInputSchema(serde_json::json!({"type": "object"})),
+                    output_schema: ToolOutputSchema(serde_json::json!({"type": "object"})),
+                    permission_spec: ToolPermissionSpec { required: vec![PermissionKind::McpConnectorCall] },
+                    idempotency_policy: IdempotencyPolicy::Idempotent,
+                };
+                Arc::new(McpResourceProxyTool {
+                    server_name: server_name.to_string(),
+                    uri: r.uri,
+                    spec,
+                    connection: connection.clone(),
+                }) as Arc<dyn Tool>
+            })
+            .collect())
+    }
+}
+
+impl Default for McpResourceProxy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A `sakha-tools::Tool` implementation that reads a single MCP resource over
+/// a live `McpConnection`.
+pub struct McpResourceProxyTool {
+    pub server_name: String,
+    pub uri: String,
+    pub spec: ToolSpec,
+    pub connection: Arc<McpConnection>,
+}
+
+#[async_trait]
+impl Tool for McpResourceProxyTool {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn validate(&self, input: serde_json::Value) -> SakhaResult<ValidatedInput> {
+        Ok(ValidatedInput(input))
+    }
+
+    async fn plan(&self, _input: &ValidatedInput, _context: &ToolContext) -> SakhaResult<ToolPlan> {
+        Ok(ToolPlan {
+            summary: format!("Read MCP resource '{}' on server '{}'", self.uri, self.server_name),
+            affected_paths: Vec::new(),
+            is_destructive: false,
+        })
+    }
+
+    async fn execute(&self, _input: &ValidatedInput, _context: &ToolContext) -> SakhaResult<ToolResult> {
+        let output = self.connection.read_resource(&self.uri).await?;
+        Ok(ToolResult::success(output))
+    }
+
+    fn summarize(&self, result: &ToolResult) -> ToolSummary {
+        let text = match result.status {
+            sakha_tools::ToolCallStatus::Succeeded => format!("mcp.{}.resource[{}] succeeded", self.server_name, self.uri),
+            _ => format!(
+                "mcp.{}.resource[{}] failed: {}",
+                self.server_name,
+                self.uri,
                 result.error_message.clone().unwrap_or_default()
             ),
         };

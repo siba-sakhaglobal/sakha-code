@@ -196,12 +196,23 @@ pub enum SearchEndpointKind {
 
 /// Config for a JSON HTTP search endpoint (SearxNG instance, Brave API,
 /// or a compatible internal connector). See spec "Search Providers".
+///
+/// `api_key` is intentionally excluded from `Serialize`/`Deserialize`
+/// (`#[serde(skip)]`): per spec this secret must "never [be] logged" and
+/// config values that derive `Serialize` are routinely dumped into logs,
+/// audit trails, or `GET` debug endpoints elsewhere in the workspace, so the
+/// only safe default is for the key to never round-trip through JSON at all.
+/// Callers that need to persist/load it must do so through a dedicated
+/// secret store, not this struct's `Deserialize` impl (which always yields
+/// `None` for this field).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchEndpointConfig {
     pub kind: SearchEndpointKind,
     pub base_url: String,
     /// Optional API key, sent as `X-Subscription-Token` (Brave) or as a
-    /// query param (`?key=`) depending on `kind`. Never logged.
+    /// query param (`?key=`) depending on `kind`. Never logged, never
+    /// serialized.
+    #[serde(skip, default)]
     pub api_key: Option<String>,
     pub timeout_secs: u64,
 }
@@ -431,5 +442,24 @@ mod tests {
         let body = serde_json::json!({ "results": [ {"title": "no url"} ] });
         let results = client.parse_response(&body);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_endpoint_config_never_serializes_api_key() {
+        let config = SearchEndpointConfig::brave("super-secret-key");
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("super-secret-key"), "api_key leaked into serialized config: {json}");
+        assert!(!json.contains("api_key"), "api_key field name should be skipped entirely: {json}");
+    }
+
+    #[test]
+    fn search_endpoint_config_deserializes_without_api_key_field() {
+        let json = serde_json::json!({
+            "kind": "searx_ng",
+            "base_url": "https://searx.example.com/search",
+            "timeout_secs": 20
+        });
+        let config: SearchEndpointConfig = serde_json::from_value(json).unwrap();
+        assert!(config.api_key.is_none());
     }
 }

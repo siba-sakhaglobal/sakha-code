@@ -7,6 +7,8 @@ mod commands;
 mod config;
 mod output;
 mod runtime;
+#[cfg(test)]
+mod test_support;
 
 use clap::{Parser, Subcommand};
 

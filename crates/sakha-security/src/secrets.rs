@@ -94,8 +94,15 @@ impl InMemorySecretStore {
         Self::default()
     }
 
+    /// Records an access, tolerating a poisoned lock: a panic during some
+    /// unrelated access must not make the audit log itself unusable, since
+    /// losing the ability to audit secret access is worse than recovering
+    /// the (still-valid) data behind a poisoned lock. See spec "provide
+    /// auditable safety" (secret access must stay auditable/recoverable, not
+    /// crash the process).
     fn record(&self, key: &str, action: SecretAction, found: bool) {
-        self.log.lock().unwrap().push(SecretAccessRecord {
+        let mut log = self.log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        log.push(SecretAccessRecord {
             key: key.to_string(),
             action,
             found,
@@ -106,7 +113,12 @@ impl InMemorySecretStore {
 #[async_trait]
 impl SecretStore for InMemorySecretStore {
     async fn get(&self, secret_ref: &SecretRef) -> Result<Option<String>, SakhaError> {
-        let value = self.values.lock().unwrap().get(&secret_ref.key).cloned();
+        let value = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&secret_ref.key)
+            .cloned();
         self.record(&secret_ref.key, SecretAction::Get, value.is_some());
         Ok(value)
     }
@@ -114,14 +126,19 @@ impl SecretStore for InMemorySecretStore {
     async fn set(&self, secret_ref: &SecretRef, value: &str) -> Result<(), SakhaError> {
         self.values
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(secret_ref.key.clone(), value.to_string());
         self.record(&secret_ref.key, SecretAction::Set, true);
         Ok(())
     }
 
     async fn delete(&self, secret_ref: &SecretRef) -> Result<(), SakhaError> {
-        let existed = self.values.lock().unwrap().remove(&secret_ref.key).is_some();
+        let existed = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&secret_ref.key)
+            .is_some();
         self.record(&secret_ref.key, SecretAction::Delete, existed);
         Ok(())
     }
@@ -130,7 +147,7 @@ impl SecretStore for InMemorySecretStore {
         let refs = self
             .values
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .map(|k| SecretRef::new(k.clone()))
             .collect();
@@ -139,7 +156,7 @@ impl SecretStore for InMemorySecretStore {
     }
 
     fn access_log(&self) -> Vec<SecretAccessRecord> {
-        self.log.lock().unwrap().clone()
+        self.log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 }
 
@@ -243,6 +260,46 @@ mod tests {
         let got = store.get(&secret_ref).await.unwrap();
         assert_eq!(got.as_deref(), Some("env-value"));
         std::env::remove_var("SAKHA_TEST_SECRET_XYZ");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_survives_poisoned_values_lock() {
+        use std::sync::Arc;
+        let store = Arc::new(InMemorySecretStore::new());
+        let secret_ref = SecretRef::new("api_key");
+        store.set(&secret_ref, "raw-value").await.unwrap();
+
+        // Poison the `values` mutex by panicking while holding it.
+        let poisoner = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.values.lock().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+        assert!(store.values.is_poisoned());
+
+        // Access after poisoning must recover rather than panic.
+        let got = store.get(&secret_ref).await.unwrap();
+        assert_eq!(got.as_deref(), Some("raw-value"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_survives_poisoned_log_lock() {
+        use std::sync::Arc;
+        let store = Arc::new(InMemorySecretStore::new());
+
+        let poisoner = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.log.lock().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+        assert!(store.log.is_poisoned());
+
+        let secret_ref = SecretRef::new("token");
+        store.set(&secret_ref, "v").await.unwrap();
+        let log = store.access_log();
+        assert!(log.iter().any(|r| r.key == "token" && r.action == SecretAction::Set));
     }
 
     #[test]

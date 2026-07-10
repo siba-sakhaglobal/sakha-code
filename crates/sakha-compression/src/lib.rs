@@ -6,6 +6,7 @@
 
 pub mod compressor;
 pub mod headroom;
+pub mod manager;
 pub mod mcp;
 pub mod policy;
 pub mod retrieval;
@@ -20,7 +21,8 @@ pub use headroom::{
     HeadroomClient, HeadroomCompressRequest, HeadroomCompressResponse, HeadroomHttpConfig, HeadroomMode, HeadroomSidecar,
     HttpHeadroomClient, UnavailableHeadroomClient,
 };
-pub use mcp::HeadroomMcpClient;
+pub use manager::{CompressionAudit, CompressionAuditLog, CompressionManager, ContextClassifier};
+pub use mcp::{HeadroomMcpClient, McpToolInvoker};
 pub use policy::{CompressionDecision, CompressionPolicy, CompressionRoute, ContentKind, FailPolicy};
 pub use retrieval::{extract_marker_ids, CompressionMarker, InMemoryRetrievalStore, RetrievalStore};
 pub use sidecar::{SidecarConfig, SidecarLauncher};

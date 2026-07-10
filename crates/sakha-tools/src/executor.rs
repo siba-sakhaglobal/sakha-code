@@ -51,6 +51,35 @@ fn compute_idempotency_key(tool_name: &ToolName, input_json: &serde_json::Value)
     sakha_core::artifact::content_hash_hex(&bytes)
 }
 
+/// Upper bound on the number of entries kept in the idempotency cache. Once
+/// reached, the oldest entries (by insertion order) are evicted to make room
+/// for new ones, so a long-running session can never grow this cache without
+/// limit (spec: tool execution must stay within a bounded footprint).
+const MAX_IDEMPOTENCY_CACHE_ENTRIES: usize = 1000;
+
+/// Recovers a `Mutex` guard even if the mutex was poisoned by a prior
+/// panicking holder, so a single panicked call site can never take down every
+/// subsequent call through this executor. Poisoning here just means "the data
+/// might be inconsistent from a half-finished mutation"; for an audit log
+/// (append-only) and an idempotency cache (best-effort dedup) that's an
+/// acceptable degradation, whereas propagating the panic (via `.unwrap()`)
+/// would violate the "executor returns Err, never panics" contract.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Locks the idempotency cache, recovering from poisoning, and wraps the
+/// (infallible in practice) result in `SakhaResult` so callers can use `?`
+/// uniformly with other fallible steps in `execute()`.
+fn lock_idempotency_cache(
+    mutex: &Mutex<HashMap<String, ToolResult>>,
+) -> SakhaResult<std::sync::MutexGuard<'_, HashMap<String, ToolResult>>> {
+    Ok(lock_or_recover(mutex))
+}
+
 /// Drives a `ToolCall` through validate -> risk -> permission -> idempotency
 /// -> execute, against a `ToolRegistry` and `PermissionPolicy`, and keeps an
 /// in-memory audit trail plus an idempotency result cache.
@@ -60,6 +89,9 @@ pub struct ToolExecutor {
     risk_classifier: RiskClassifier,
     audit_log: Mutex<Vec<ToolAuditRecord>>,
     idempotency_cache: Mutex<HashMap<String, ToolResult>>,
+    /// Insertion order of `idempotency_cache` keys, used to evict the oldest
+    /// entry once `MAX_IDEMPOTENCY_CACHE_ENTRIES` is reached.
+    idempotency_order: Mutex<std::collections::VecDeque<String>>,
 }
 
 impl ToolExecutor {
@@ -70,6 +102,7 @@ impl ToolExecutor {
             risk_classifier: RiskClassifier::new(),
             audit_log: Mutex::new(Vec::new()),
             idempotency_cache: Mutex::new(HashMap::new()),
+            idempotency_order: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -105,7 +138,10 @@ impl ToolExecutor {
             spec.idempotency_policy,
             IdempotencyPolicy::Idempotent | IdempotencyPolicy::IdempotentWithKey
         ) {
-            if let Some(cached) = self.idempotency_cache.lock().unwrap().get(&idempotency_key).cloned() {
+            let cached = lock_idempotency_cache(&self.idempotency_cache)?
+                .get(&idempotency_key)
+                .cloned();
+            if let Some(cached) = cached {
                 self.record_audit(ToolAuditRecord {
                     call_id: call.id,
                     tool_name: call.tool_name.clone(),
@@ -168,22 +204,38 @@ impl ToolExecutor {
             spec.idempotency_policy,
             IdempotencyPolicy::Idempotent | IdempotencyPolicy::IdempotentWithKey
         ) {
-            self.idempotency_cache
-                .lock()
-                .unwrap()
-                .insert(idempotency_key, result.clone());
+            self.cache_idempotent_result(idempotency_key, result.clone());
         }
 
         Ok(result)
     }
 
+    /// Inserts `result` into the idempotency cache under `key`, evicting the
+    /// oldest entry first if the cache is already at
+    /// `MAX_IDEMPOTENCY_CACHE_ENTRIES`, so the cache never grows without
+    /// bound across a long-running session.
+    fn cache_idempotent_result(&self, key: String, result: ToolResult) {
+        let mut cache = lock_or_recover(&self.idempotency_cache);
+        let mut order = lock_or_recover(&self.idempotency_order);
+
+        if !cache.contains_key(&key) {
+            if cache.len() >= MAX_IDEMPOTENCY_CACHE_ENTRIES {
+                if let Some(oldest) = order.pop_front() {
+                    cache.remove(&oldest);
+                }
+            }
+            order.push_back(key.clone());
+        }
+        cache.insert(key, result);
+    }
+
     fn record_audit(&self, record: ToolAuditRecord) {
-        self.audit_log.lock().unwrap().push(record);
+        lock_or_recover(&self.audit_log).push(record);
     }
 
     /// Returns a snapshot of all audit records written so far, in order.
     pub fn audit_records(&self) -> Vec<ToolAuditRecord> {
-        self.audit_log.lock().unwrap().clone()
+        lock_or_recover(&self.audit_log).clone()
     }
 }
 
@@ -334,5 +386,58 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].started);
         assert!(!records[0].completed);
+    }
+
+    #[tokio::test]
+    async fn idempotency_cache_is_bounded_and_evicts_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with_file_tools();
+        let policy = PermissionPolicy::new();
+        let executor = ToolExecutor::new(registry, policy);
+        let context = ToolContext::new(dir.path())
+            .with_permission_checker(Arc::new(|_req| sakha_security::PermissionDecision::allowed()));
+
+        // Insert more entries than the cache can hold; this must not grow
+        // the cache without bound, and must not panic.
+        for i in 0..(super::MAX_IDEMPOTENCY_CACHE_ENTRIES + 10) {
+            let filename = format!("f{i}.txt");
+            tokio::fs::write(dir.path().join(&filename), "x").await.unwrap();
+            let call = ToolCall {
+                id: ToolCallId::new(),
+                tool_name: ToolName::new("file.read"),
+                input_json: serde_json::json!({"path": filename}),
+            };
+            executor.execute(call, &context).await.unwrap();
+        }
+
+        let cache_len = lock_or_recover(&executor.idempotency_cache).len();
+        assert!(cache_len <= super::MAX_IDEMPOTENCY_CACHE_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn poisoned_audit_log_mutex_does_not_panic_subsequent_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_with_file_tools();
+        let policy = PermissionPolicy::new();
+        let executor = ToolExecutor::new(registry, policy);
+
+        // Poison the audit_log mutex by panicking while holding the lock.
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = executor.audit_log.lock().unwrap();
+            panic!("simulated panic while holding the audit log lock");
+        }));
+        assert!(poison_result.is_err());
+        assert!(executor.audit_log.is_poisoned());
+
+        // A subsequent call must still return normally (Err or Ok), never panic.
+        let context = ToolContext::new(dir.path())
+            .with_permission_checker(Arc::new(|_req| sakha_security::PermissionDecision::allowed()));
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            tool_name: ToolName::new("file.write"),
+            input_json: serde_json::json!({"path": "a.txt", "content": "hello"}),
+        };
+        let result = executor.execute(call, &context).await;
+        assert!(result.is_ok());
     }
 }

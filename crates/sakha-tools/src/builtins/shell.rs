@@ -26,6 +26,16 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// summarized/compressed").
 const MAX_CAPTURED_BYTES: usize = 200 * 1024;
 
+/// Hard cap on the number of bytes drained (and discarded) from a stream
+/// after `MAX_CAPTURED_BYTES` has already been captured. Without this, a
+/// child process that keeps writing to a pipe forever (e.g. `yes`) would
+/// make the drain loop run indefinitely even though nothing more is kept, in
+/// violation of "no unbounded loops without a budget check". Once this many
+/// extra bytes have been discarded, the drain loop gives up; the overall
+/// per-command wall-clock `timeout_secs` (already enforced by the caller via
+/// `tokio::time::timeout`) is the final backstop that reclaims the process.
+const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
 /// Environment variable name fragments that mark a variable as a secret and
 /// therefore excluded from the sanitized child environment. Case-insensitive
 /// substring match, per module 09 "Commands inherit sanitized environment by
@@ -55,8 +65,18 @@ async fn capture_stream<R: tokio::io::AsyncRead + Unpin>(
                     buf.extend_from_slice(&chunk[..remaining.min(n)]);
                     truncated = true;
                     // Keep draining so the child doesn't block on a full pipe,
-                    // but stop accumulating.
-                    while reader.read(&mut chunk).await.unwrap_or(0) > 0 {}
+                    // but stop accumulating, and cap total drained bytes so a
+                    // child that writes forever can't spin this loop forever.
+                    let mut drained = 0usize;
+                    loop {
+                        if drained >= MAX_DRAIN_BYTES {
+                            break;
+                        }
+                        match reader.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read_n) => drained += read_n,
+                        }
+                    }
                     break;
                 }
                 buf.extend_from_slice(&chunk[..n]);
@@ -90,9 +110,11 @@ impl Tool for ShellRunTool {
             output_schema: ToolOutputSchema(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "exit_code": {"type": "integer"},
+                    "exit_code": {"type": ["integer", "null"]},
                     "stdout": {"type": "string"},
+                    "stdout_truncated": {"type": "boolean"},
                     "stderr": {"type": "string"},
+                    "stderr_truncated": {"type": "boolean"},
                     "timed_out": {"type": "boolean"}
                 }
             })),
@@ -201,7 +223,9 @@ impl Tool for ShellRunTool {
                     output_json: serde_json::json!({
                         "exit_code": null,
                         "stdout": "",
+                        "stdout_truncated": false,
                         "stderr": "",
+                        "stderr_truncated": false,
                         "timed_out": true,
                     }),
                     raw_output_ref: None,

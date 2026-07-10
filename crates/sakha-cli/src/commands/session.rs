@@ -7,9 +7,11 @@
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use sakha_memory::{InMemorySessionStore, SessionRecord, SessionStatus, SessionStore};
+use sakha_memory::{SessionRecord, SessionStatus, SessionStore};
 
+use crate::config::{default_config_path, load_config};
 use crate::output::{print_error, print_output, OutputFormat};
+use crate::runtime::build_session_store;
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
@@ -85,13 +87,12 @@ pub fn execute(command: SessionCommand) -> i32 {
     rt.block_on(execute_async(command))
 }
 
-/// Sessions created via `sakha chat` currently live in that process's
-/// in-memory store; `session list/show/resume` here operate against a fresh
-/// in-memory store (empty on every invocation) until a durable `db_path` is
-/// configured and threaded through, at which point this swaps to
-/// `SqliteSessionStore`. This is documented rather than silently misleading:
-/// an empty list / not-found result is expected and correct for the current
-/// wiring, never a crash.
+/// Uses `build_session_store` (SQLite-backed when `config.db_path` is set,
+/// in-memory otherwise) so `session list/show/resume` see sessions created by
+/// `sakha chat` in prior invocations whenever durable storage is configured;
+/// with no `db_path` configured, an empty list / not-found result is
+/// expected and correct (there is nothing to persist across processes),
+/// never a crash.
 async fn execute_async(command: SessionCommand) -> i32 {
     match command {
         SessionCommand::GoalCreate(args) => {
@@ -105,13 +106,27 @@ async fn execute_async(command: SessionCommand) -> i32 {
             1
         }
         SessionCommand::List(args) => {
-            let store = InMemorySessionStore::new();
-            let sessions: Vec<SessionView> = list_all(&store).await.iter().map(SessionView::from).collect();
-            print_output(&sessions, args.output);
-            0
+            let store = match open_store(args.output) {
+                Ok(store) => store,
+                Err(code) => return code,
+            };
+            match store.list_sessions().await {
+                Ok(records) => {
+                    let sessions: Vec<SessionView> = records.iter().map(SessionView::from).collect();
+                    print_output(&sessions, args.output);
+                    0
+                }
+                Err(err) => {
+                    print_error(&err.to_string(), args.output);
+                    1
+                }
+            }
         }
         SessionCommand::Show(args) => {
-            let store = InMemorySessionStore::new();
+            let store = match open_store(args.output) {
+                Ok(store) => store,
+                Err(code) => return code,
+            };
             let id = match args.session_id.parse::<sakha_core::SessionId>() {
                 Ok(id) => id,
                 Err(_) => {
@@ -135,7 +150,10 @@ async fn execute_async(command: SessionCommand) -> i32 {
             }
         }
         SessionCommand::Resume(args) => {
-            let store = InMemorySessionStore::new();
+            let store = match open_store(args.output) {
+                Ok(store) => store,
+                Err(code) => return code,
+            };
             let id = match args.session_id.parse::<sakha_core::SessionId>() {
                 Ok(id) => id,
                 Err(_) => {
@@ -163,17 +181,27 @@ async fn execute_async(command: SessionCommand) -> i32 {
     }
 }
 
-/// `InMemorySessionStore` does not expose a `list_all`; this helper is a
-/// placeholder that returns an empty list until a durable listing API lands.
-/// Kept as its own function so the swap to a real `list_sessions()` (once
-/// added to `SessionStore`) is a one-line change at the call site.
-async fn list_all(_store: &InMemorySessionStore) -> Vec<SessionRecord> {
-    Vec::new()
+/// Loads config and builds the shared `SessionStore` (spec-durable when
+/// `db_path` is configured), or reports a config-load error and returns the
+/// exit code the caller should propagate.
+fn open_store(output: OutputFormat) -> Result<std::sync::Arc<dyn SessionStore>, i32> {
+    let config = match load_config(&default_config_path()) {
+        Ok(c) => c,
+        Err(err) => {
+            print_error(&format!("failed to load config: {err}"), output);
+            return Err(2);
+        }
+    };
+    build_session_store(&config).map_err(|err| {
+        print_error(&format!("failed to open session store: {err}"), output);
+        1
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempHome;
 
     #[test]
     fn goal_create_parses() {
@@ -192,12 +220,14 @@ mod tests {
 
     #[test]
     fn session_list_returns_success() {
+        let _home = TempHome::new();
         let code = execute(SessionCommand::List(SessionListArgs { output: OutputFormat::Json }));
         assert_eq!(code, 0);
     }
 
     #[test]
     fn session_show_missing_returns_not_found() {
+        let _home = TempHome::new();
         let code = execute(SessionCommand::Show(SessionShowArgs {
             session_id: sakha_core::SessionId::new().to_string(),
             output: OutputFormat::Json,
@@ -207,10 +237,54 @@ mod tests {
 
     #[test]
     fn session_show_invalid_id_returns_config_error() {
+        let _home = TempHome::new();
         let code = execute(SessionCommand::Show(SessionShowArgs {
             session_id: "not-a-uuid".into(),
             output: OutputFormat::Json,
         }));
         assert_eq!(code, 2);
+    }
+
+    /// End-to-end proof that `sakha session list` enumerates sessions once a
+    /// durable `db_path` is configured: a session is created directly through
+    /// `build_session_store` (as `sakha chat` would), then `session list`
+    /// against the same `db_path` must find it (spec: "sakha session list to
+    /// enumerate sessions").
+    #[test]
+    fn session_list_enumerates_sessions_when_db_path_configured() {
+        let home = TempHome::new();
+        let db_path = home.path().join("sessions.sqlite3");
+
+        let mut config = crate::config::SakhaConfig::default();
+        config.db_path = Some(db_path.to_string_lossy().to_string());
+        crate::config::save_config(&crate::config::default_config_path(), &config).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session_id = sakha_core::SessionId::new();
+        rt.block_on(async {
+            let store = build_session_store(&config).unwrap();
+            store
+                .create_session(SessionRecord {
+                    id: session_id,
+                    workspace_id: sakha_core::WorkspaceId::new(),
+                    goal_id: None,
+                    status: SessionStatus::Active,
+                    provider_profile: None,
+                    created_at: sakha_core::time::now_utc(),
+                    updated_at: sakha_core::time::now_utc(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let code = execute(SessionCommand::List(SessionListArgs { output: OutputFormat::Json }));
+        assert_eq!(code, 0);
+
+        // Show must also find it via the same durable store.
+        let show_code = execute(SessionCommand::Show(SessionShowArgs {
+            session_id: session_id.to_string(),
+            output: OutputFormat::Json,
+        }));
+        assert_eq!(show_code, 0);
     }
 }

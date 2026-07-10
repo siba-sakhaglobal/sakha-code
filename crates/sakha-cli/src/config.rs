@@ -70,11 +70,18 @@ pub struct SakhaConfig {
 }
 
 /// Returns the default config file path: `~/.sakha/config.toml`.
+///
+/// Checks `SAKHA_HOME` first (an explicit override, e.g. for CI or tests
+/// that want a hermetic config directory) before falling back to
+/// `dirs::home_dir()`. This matters beyond convenience: on Windows,
+/// `dirs::home_dir()` resolves via the `SHGetKnownFolderPath` API rather than
+/// reading `HOME`/`USERPROFILE` from the process environment, so tests that
+/// only override those env vars do not actually redirect
+/// `default_config_path()` and can silently read/write the real
+/// `~/.sakha/config.toml`. `SAKHA_HOME` sidesteps that platform quirk.
 pub fn default_config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".sakha")
-        .join("config.toml")
+    let home = std::env::var_os("SAKHA_HOME").map(PathBuf::from).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("."));
+    home.join(".sakha").join("config.toml")
 }
 
 /// Expands `${VAR}` (and bare `$VAR`) references in `input` using the

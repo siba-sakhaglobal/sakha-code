@@ -75,6 +75,10 @@ pub trait SessionStore: Send + Sync {
     async fn update_session_status(&self, id: SessionId, status: SessionStatus) -> SakhaResult<()>;
     async fn append_turn(&self, turn: TurnRecord) -> SakhaResult<()>;
     async fn list_turns(&self, session_id: SessionId) -> SakhaResult<Vec<TurnRecord>>;
+    /// Lists every known session, most recently updated first. Backs `sakha
+    /// session list` (spec `modules/13-ui-cli-tui-web-desktop.md` "CLI
+    /// Commands").
+    async fn list_sessions(&self) -> SakhaResult<Vec<SessionRecord>>;
 }
 
 /// In-memory `SessionStore`, used for tests and as a safe default before the
@@ -130,6 +134,13 @@ impl SessionStore for InMemorySessionStore {
         let turns = self.turns.lock().map_err(|_| poison_err("sakha-memory", "list_turns"))?;
         Ok(turns.iter().filter(|t| t.session_id == session_id).cloned().collect())
     }
+
+    async fn list_sessions(&self) -> SakhaResult<Vec<SessionRecord>> {
+        let sessions = self.sessions.lock().map_err(|_| poison_err("sakha-memory", "list_sessions"))?;
+        let mut records: Vec<SessionRecord> = sessions.values().cloned().collect();
+        records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(records)
+    }
 }
 
 /// SQLite-backed `SessionStore`, used for durable session resume across
@@ -151,6 +162,31 @@ fn opt_to_str<T: ToString>(v: &Option<T>) -> Option<String> {
 
 fn parse_opt<T: FromStr>(s: Option<String>) -> Option<T> {
     s.and_then(|s| T::from_str(&s).ok())
+}
+
+/// Raw column tuple for one `sessions` row, in `SELECT id, workspace_id,
+/// goal_id, status, provider_profile, created_at, updated_at` order.
+type SessionRow = (String, String, Option<String>, String, Option<String>, String, String);
+
+/// Parses one raw `SessionRow` into a `SessionRecord`, shared by
+/// `get_session` and `list_sessions` so the column-to-field mapping (and its
+/// error handling) lives in exactly one place.
+fn session_record_from_row(row: SessionRow) -> SakhaResult<SessionRecord> {
+    let (id, workspace_id, goal_id, status, provider_profile, created_at, updated_at) = row;
+    Ok(SessionRecord {
+        id: SessionId::from_str(&id).map_err(|e| SakhaError::integrity("sakha-memory", "bad session id").with_cause(e))?,
+        workspace_id: WorkspaceId::from_str(&workspace_id)
+            .map_err(|e| SakhaError::integrity("sakha-memory", "bad workspace id").with_cause(e))?,
+        goal_id: parse_opt(goal_id),
+        status: SessionStatus::parse(&status)?,
+        provider_profile: parse_opt(provider_profile),
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|e| SakhaError::integrity("sakha-memory", "bad created_at").with_cause(e))?
+            .with_timezone(&chrono::Utc),
+        updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .map_err(|e| SakhaError::integrity("sakha-memory", "bad updated_at").with_cause(e))?
+            .with_timezone(&chrono::Utc),
+    })
 }
 
 #[async_trait]
@@ -181,7 +217,7 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn get_session(&self, id: SessionId) -> SakhaResult<Option<SessionRecord>> {
-        let row: Option<(String, String, Option<String>, String, Option<String>, String, String)> = self
+        let row: Option<SessionRow> = self
             .db
             .with_conn(|conn| {
                 conn.query_row(
@@ -203,24 +239,7 @@ impl SessionStore for SqliteSessionStore {
                 .optional()
             })?;
 
-        let Some((id, workspace_id, goal_id, status, provider_profile, created_at, updated_at)) = row else {
-            return Ok(None);
-        };
-
-        Ok(Some(SessionRecord {
-            id: SessionId::from_str(&id).map_err(|e| SakhaError::integrity("sakha-memory", "bad session id").with_cause(e))?,
-            workspace_id: WorkspaceId::from_str(&workspace_id)
-                .map_err(|e| SakhaError::integrity("sakha-memory", "bad workspace id").with_cause(e))?,
-            goal_id: parse_opt(goal_id),
-            status: SessionStatus::parse(&status)?,
-            provider_profile: parse_opt(provider_profile),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
-                .map_err(|e| SakhaError::integrity("sakha-memory", "bad created_at").with_cause(e))?
-                .with_timezone(&chrono::Utc),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
-                .map_err(|e| SakhaError::integrity("sakha-memory", "bad updated_at").with_cause(e))?
-                .with_timezone(&chrono::Utc),
-        }))
+        row.map(session_record_from_row).transpose()
     }
 
     async fn update_session_status(&self, id: SessionId, status: SessionStatus) -> SakhaResult<()> {
@@ -277,5 +296,20 @@ impl SessionStore for SqliteSessionStore {
                 })
             })
             .collect()
+    }
+
+    async fn list_sessions(&self) -> SakhaResult<Vec<SessionRecord>> {
+        let rows: Vec<SessionRow> = self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, workspace_id, goal_id, status, provider_profile, created_at, updated_at
+                 FROM sessions ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            })?;
+            rows.collect()
+        })?;
+
+        rows.into_iter().map(session_record_from_row).collect()
     }
 }

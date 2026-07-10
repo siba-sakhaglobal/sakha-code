@@ -277,6 +277,24 @@ pub trait LoopController: Send + Sync {
     async fn resume(&self, loop_id: LoopId) -> SakhaResult<()>;
     async fn stop(&self, loop_id: LoopId, reason: StopReason) -> SakhaResult<()>;
     async fn detect_stall(&self, loop_id: LoopId) -> SakhaResult<StallReport>;
+    /// Lists every loop this controller currently knows about (spec "CLI
+    /// Commands": `sakha loop list`). For an in-process `LoopRuntime` this is
+    /// every loop created via `create_loop` since the runtime was
+    /// constructed; a daemon holding one long-lived `LoopRuntime` therefore
+    /// sees every loop it manages, while a fresh per-invocation runtime (as
+    /// today's CLI wiring uses) legitimately sees none yet.
+    async fn list(&self) -> SakhaResult<Vec<LoopSummary>>;
+}
+
+/// A lightweight, serializable view of one loop's current state — enough for
+/// `sakha loop list` without exposing `LoopRuntime`'s internal `LoopEntry`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopSummary {
+    pub id: LoopId,
+    pub objective: String,
+    pub kind: crate::spec::LoopKind,
+    pub state: LoopState,
+    pub iteration: u64,
 }
 
 /// Per-loop bookkeeping the runtime keeps alongside the immutable spec.
@@ -711,6 +729,20 @@ impl LoopController for LoopRuntime {
         budget.debit_elapsed_wall_time().ok();
         Ok(self.watchdog.lock().unwrap().check_budget(budget.ledger()))
     }
+
+    async fn list(&self) -> SakhaResult<Vec<LoopSummary>> {
+        let entries = self.entries.lock().unwrap();
+        Ok(entries
+            .values()
+            .map(|entry| LoopSummary {
+                id: entry.spec.id,
+                objective: entry.spec.objective.clone(),
+                kind: entry.spec.loop_kind,
+                state: entry.state,
+                iteration: entry.iteration,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -907,6 +939,29 @@ mod tests {
         runtime.tick(loop_id).await.unwrap();
         let report = runtime.detect_stall(loop_id).await.unwrap();
         assert!(report.stalled);
+    }
+
+    /// `list()` enumerates every loop created on this runtime (spec "CLI
+    /// Commands": `sakha loop list`), reflecting state/iteration changes as
+    /// the loop progresses, not just the state at creation time.
+    #[tokio::test]
+    async fn list_enumerates_created_loops_with_current_state() {
+        let runtime = LoopRuntime::new();
+        assert!(runtime.list().await.unwrap().is_empty());
+
+        let spec = LoopSpec::new("nightly build check", LoopKind::Verification, Trigger::Manual);
+        let loop_id = runtime.create_loop(spec).await.unwrap();
+
+        let summaries = runtime.list().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, loop_id);
+        assert_eq!(summaries[0].objective, "nightly build check");
+        assert_eq!(summaries[0].kind, LoopKind::Verification);
+        assert_eq!(summaries[0].state, LoopState::Created);
+
+        runtime.pause(loop_id).await.unwrap();
+        let summaries = runtime.list().await.unwrap();
+        assert_eq!(summaries[0].state, LoopState::Paused);
     }
 
     // --- New coverage: LoopBudget wall-clock, FeedbackRecord, side-effect

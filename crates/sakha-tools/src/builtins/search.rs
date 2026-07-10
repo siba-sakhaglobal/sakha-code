@@ -175,10 +175,17 @@ fn search_directory(root: &std::path::Path, regex: &Regex, max_matches: usize) -
             continue;
         }
 
-        let content = match std::fs::read_to_string(entry.path()) {
-            Ok(c) => c,
-            Err(_) => continue, // skip binary/unreadable files
+        // Read as raw bytes and lossily convert to UTF-8 rather than using
+        // `read_to_string` directly: a file that is mostly-text but contains
+        // a handful of invalid UTF-8 byte sequences (common with generated
+        // files, logs, or mixed-encoding sources) would otherwise be skipped
+        // entirely instead of having its still-valid lines searched.
+        // Genuinely unreadable/binary files are still skipped on I/O error.
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(b) => b,
+            Err(_) => continue, // skip unreadable files (permissions, etc.)
         };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
 
         let display_path = entry.path().to_string_lossy().to_string();
         for (idx, line) in content.lines().enumerate() {

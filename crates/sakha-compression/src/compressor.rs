@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use sakha_core::{ArtifactKind, ArtifactRef, SakhaError, SakhaResult};
+use sakha_security::Redactor;
 
 use crate::headroom::HeadroomClient;
 use crate::policy::{CompressionPolicy, CompressionRoute, ContentKind};
@@ -187,6 +188,7 @@ pub struct LocalFallbackCompressor {
     pub config: LocalFallbackConfig,
     pub retrieval_store: Arc<dyn RetrievalStore>,
     pub stats: Arc<StatsRecorder>,
+    pub redactor: Arc<Redactor>,
 }
 
 impl LocalFallbackCompressor {
@@ -195,6 +197,7 @@ impl LocalFallbackCompressor {
             config: LocalFallbackConfig::default(),
             retrieval_store,
             stats: Arc::new(StatsRecorder::new()),
+            redactor: Arc::new(Redactor::new()),
         }
     }
 
@@ -206,6 +209,27 @@ impl LocalFallbackCompressor {
     pub fn with_stats(mut self, stats: Arc<StatsRecorder>) -> Self {
         self.stats = stats;
         self
+    }
+
+    /// Overrides the default `Redactor` used to enforce
+    /// `CompressionPolicy::redact_before_compress` (e.g. with project-specific
+    /// secret patterns).
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.redactor = redactor;
+        self
+    }
+
+    /// Applies `redact_before_compress` when the policy requires it, per
+    /// spec "Policy Fields" and the "Sensitive data compressed before
+    /// redaction" failure mode: any secret-shaped content must be scrubbed
+    /// before it is stored as a raw artifact or truncated into the
+    /// model-visible compressed content, not after.
+    fn maybe_redact(&self, content: String, policy: &CompressionPolicy) -> String {
+        if policy.redact_before_compress {
+            self.redactor.redact(&content)
+        } else {
+            content
+        }
     }
 }
 
@@ -220,21 +244,26 @@ impl ContextCompressor for LocalFallbackCompressor {
         let scope = CompressionScope::Global;
         let raw_tokens = item.estimated_tokens();
         let decision = policy.decide(kind, raw_tokens);
+        // Redact before anything else touches the content: a raw artifact
+        // stored (or a truncated view built) from unredacted text would
+        // reproduce the "Sensitive data compressed before redaction" failure
+        // mode regardless of what happens downstream.
+        let content = self.maybe_redact(item.content, policy);
 
-        if !decision.should_compress || item.content.len() < self.config.min_bytes_to_truncate {
+        if !decision.should_compress || content.len() < self.config.min_bytes_to_truncate {
             self.stats.record_compression(scope, raw_tokens, raw_tokens, true);
             return Ok(CompressedContextItem {
-                compressed_content: item.content,
+                compressed_content: content,
                 marker: None,
                 token_estimate_raw: raw_tokens,
                 token_estimate_compressed: raw_tokens,
             });
         }
 
-        // Store the raw artifact first (reversible CCR requirement: raw
-        // content must exist before the model ever sees the compressed
-        // marker referencing it).
-        let raw_bytes = item.content.as_bytes();
+        // Store the raw (redacted-if-required) artifact first (reversible
+        // CCR requirement: raw content must exist before the model ever sees
+        // the compressed marker referencing it).
+        let raw_bytes = content.as_bytes();
         let content_hash = sakha_core::artifact::content_hash_hex(raw_bytes);
         let artifact_kind = match kind {
             ContentKind::JsonData => ArtifactKind::Json,
@@ -248,7 +277,7 @@ impl ContextCompressor for LocalFallbackCompressor {
         let marker = CompressionMarker::new(raw_artifact.clone());
         self.retrieval_store.put(marker.clone()).await?;
 
-        let deduped = dedup_consecutive_lines(&item.content);
+        let deduped = dedup_consecutive_lines(&content);
         let truncated = head_tail_truncate(
             &deduped,
             self.config.head_lines,
@@ -329,14 +358,20 @@ impl ContextCompressor for HeadroomBackedCompressor {
         );
 
         if use_headroom {
+            // Redact before content ever leaves the process, whether to a
+            // sidecar (localhost) or a proxy (potentially remote): Headroom
+            // is an external integration and must never see unredacted
+            // secrets when `redact_before_compress` is set (spec failure
+            // mode "Sensitive data compressed before redaction").
+            let content = self.fallback.maybe_redact(item.content.clone(), policy);
             let content_kind = format!("{kind:?}");
             let request = crate::headroom::HeadroomCompressRequest {
-                content: item.content.clone(),
+                content: content.clone(),
                 content_kind,
             };
             match self.headroom.compress(request).await {
                 Ok(response) => {
-                    let raw_bytes = item.content.as_bytes();
+                    let raw_bytes = content.as_bytes();
                     let content_hash = sakha_core::artifact::content_hash_hex(raw_bytes);
                     let raw_artifact = item
                         .raw_artifact
@@ -345,7 +380,7 @@ impl ContextCompressor for HeadroomBackedCompressor {
                     let marker = CompressionMarker {
                         id: response.marker_id,
                         raw_artifact: raw_artifact.clone(),
-                        created_at_unix: 0,
+                        created_at_unix: crate::retrieval::now_unix(),
                     };
                     self.fallback.retrieval_store.put(marker.clone()).await?;
                     let compressed_tokens = (response.compressed.len() as u64) / 4;
@@ -494,6 +529,48 @@ mod tests {
         let policy = CompressionPolicy::default();
         let compressed = compressor.compress(item, &policy).await.unwrap();
         assert_eq!(compressed.compressed_content, json);
+    }
+
+    /// `redact_before_compress` must scrub secret-shaped content before it is
+    /// stored as a raw artifact or truncated into the compressed view (spec
+    /// "Policy Fields": `redact_before_compress`; "Failure Modes": "Sensitive
+    /// data compressed before redaction").
+    #[tokio::test]
+    async fn redact_before_compress_scrubs_secrets_from_compressed_and_raw_content() {
+        let store = Arc::new(InMemoryRetrievalStore::new());
+        let compressor = LocalFallbackCompressor::new(store.clone())
+            .with_config(LocalFallbackConfig { head_lines: 3, tail_lines: 3, min_bytes_to_truncate: 10 });
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut lines: Vec<String> = (0..200).map(|i| format!("log line {i}")).collect();
+        lines.insert(100, format!("leaked key: {secret}"));
+        let raw = lines.join("\n");
+        let mut policy = CompressionPolicy::default();
+        policy.redact_before_compress = true;
+
+        let item = ContextItem::new(raw).with_kind(ContentKind::ShellLog);
+        let compressed = compressor.compress(item, &policy).await.unwrap();
+        assert!(!compressed.compressed_content.contains(secret));
+
+        // The raw artifact behind the marker must also be redacted — the
+        // model can request retrieval, so the secret must not survive there
+        // either.
+        let marker = compressed.marker.expect("large log should get a marker");
+        let stored = store.get(&marker.id).await.unwrap().expect("marker stored");
+        assert_eq!(stored.raw_artifact, marker.raw_artifact);
+    }
+
+    /// When `redact_before_compress` is disabled, content passes through
+    /// unmodified (secrets are the caller's responsibility in that mode).
+    #[tokio::test]
+    async fn redact_before_compress_disabled_leaves_content_untouched() {
+        let store = Arc::new(InMemoryRetrievalStore::new());
+        let compressor = LocalFallbackCompressor::new(store);
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let item = ContextItem::new(format!("short {secret}"));
+        let mut policy = CompressionPolicy::default();
+        policy.redact_before_compress = false;
+        let compressed = compressor.compress(item, &policy).await.unwrap();
+        assert!(compressed.compressed_content.contains(secret));
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ pub use client::{
     ModelResponse, NullProviderClient, ProviderClient, ProviderHealth, StopReason,
     TokenCountRequest, TokenCountResult, ToolDefinition,
 };
-pub use config::{load_profiles_from_toml, well_known, ProviderKind, ProviderProfile};
+pub use config::{load_profiles_from_toml, well_known, ModelTier, ProviderKind, ProviderProfile};
 pub use cost::{estimate_cost_micros, UsageRecord};
 pub use openai_compatible::{normalize_error, OpenAiCompatibleClient};
 pub use sse::{SseEvent, SseParser};

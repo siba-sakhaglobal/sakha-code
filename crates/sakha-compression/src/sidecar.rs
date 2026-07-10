@@ -82,7 +82,7 @@ impl SidecarLauncher {
             })?;
         self.child = Some(child);
 
-        let client = HttpHeadroomClient::new(self.config.client_config());
+        let client = HttpHeadroomClient::try_new(self.config.client_config())?;
         let deadline = Duration::from_secs(self.config.startup_timeout_secs);
         let poll_interval = Duration::from_millis(200);
         let mut waited = Duration::ZERO;

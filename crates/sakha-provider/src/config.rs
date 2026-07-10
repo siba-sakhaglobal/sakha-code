@@ -38,6 +38,21 @@ pub struct ProviderProfile {
     pub extra_body: serde_json::Value,
 }
 
+/// Which model tier a request wants, per spec "Model fallback chain": a
+/// caller can ask for the profile's primary model, its faster/cheaper model,
+/// or its stronger reasoning model, and get a sensible fallback when the
+/// requested tier isn't configured on this profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    /// The profile's default/general-purpose model.
+    Primary,
+    /// A smaller, faster, cheaper model for low-stakes/high-volume calls.
+    SmallFast,
+    /// A stronger model tuned for harder reasoning tasks.
+    Reasoning,
+}
+
 impl ProviderProfile {
     /// Builds a minimal OpenAI-compatible profile pointing at `base_url`.
     pub fn openai_compatible(name: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>) -> Self {
@@ -58,6 +73,45 @@ impl ProviderProfile {
             extra_headers: Vec::new(),
             extra_body: serde_json::Value::Null,
         }
+    }
+
+    /// Resolves the model name to use for a given tier, per spec "Model
+    /// fallback chain": `SmallFast`/`Reasoning` fall back to the profile's
+    /// primary `model` when that tier isn't configured, so callers can always
+    /// request a tier without checking whether it's set first.
+    pub fn model_for_tier(&self, tier: ModelTier) -> &str {
+        match tier {
+            ModelTier::Primary => &self.model,
+            ModelTier::SmallFast => self.small_fast_model.as_deref().unwrap_or(&self.model),
+            ModelTier::Reasoning => self.reasoning_model.as_deref().unwrap_or(&self.model),
+        }
+    }
+
+    /// Builds the ordered model fallback chain for this profile, per spec
+    /// "Model fallback chain": starts with the requested tier's model, then
+    /// falls back through the remaining configured models (deduplicated,
+    /// preserving order) so a caller can retry against progressively more
+    /// conservative models if the preferred one fails.
+    pub fn fallback_chain(&self, tier: ModelTier) -> Vec<String> {
+        let ordered_tiers = match tier {
+            ModelTier::Primary => [ModelTier::Primary, ModelTier::SmallFast, ModelTier::Reasoning],
+            ModelTier::SmallFast => [ModelTier::SmallFast, ModelTier::Primary, ModelTier::Reasoning],
+            ModelTier::Reasoning => [ModelTier::Reasoning, ModelTier::Primary, ModelTier::SmallFast],
+        };
+        let mut chain = Vec::new();
+        for t in ordered_tiers {
+            let candidate = match t {
+                ModelTier::Primary => Some(self.model.clone()),
+                ModelTier::SmallFast => self.small_fast_model.clone(),
+                ModelTier::Reasoning => self.reasoning_model.clone(),
+            };
+            if let Some(candidate) = candidate {
+                if !chain.contains(&candidate) {
+                    chain.push(candidate);
+                }
+            }
+        }
+        chain
     }
 }
 
@@ -241,5 +295,38 @@ max_tokens_field = "max_completion_tokens"
     fn xai_profile_uses_well_known_base_url() {
         let profile = ProviderProfile::xai("grok-2", "XAI_API_KEY");
         assert_eq!(profile.base_url, well_known::XAI_BASE_URL);
+    }
+
+    #[test]
+    fn model_for_tier_falls_back_to_primary_when_tier_unset() {
+        let profile = ProviderProfile::openai_compatible("test", "https://example.com", "gpt-main");
+        assert_eq!(profile.model_for_tier(ModelTier::SmallFast), "gpt-main");
+        assert_eq!(profile.model_for_tier(ModelTier::Reasoning), "gpt-main");
+        assert_eq!(profile.model_for_tier(ModelTier::Primary), "gpt-main");
+    }
+
+    #[test]
+    fn model_for_tier_uses_configured_tier_model() {
+        let mut profile = ProviderProfile::openai_compatible("test", "https://example.com", "gpt-main");
+        profile.small_fast_model = Some("gpt-mini".to_string());
+        profile.reasoning_model = Some("gpt-reasoning".to_string());
+        assert_eq!(profile.model_for_tier(ModelTier::SmallFast), "gpt-mini");
+        assert_eq!(profile.model_for_tier(ModelTier::Reasoning), "gpt-reasoning");
+    }
+
+    #[test]
+    fn fallback_chain_starts_with_requested_tier_then_remaining_models() {
+        let mut profile = ProviderProfile::openai_compatible("test", "https://example.com", "gpt-main");
+        profile.small_fast_model = Some("gpt-mini".to_string());
+        profile.reasoning_model = Some("gpt-reasoning".to_string());
+        let chain = profile.fallback_chain(ModelTier::Reasoning);
+        assert_eq!(chain, vec!["gpt-reasoning".to_string(), "gpt-main".to_string(), "gpt-mini".to_string()]);
+    }
+
+    #[test]
+    fn fallback_chain_dedups_when_tiers_share_a_model() {
+        let profile = ProviderProfile::openai_compatible("test", "https://example.com", "gpt-main");
+        let chain = profile.fallback_chain(ModelTier::Primary);
+        assert_eq!(chain, vec!["gpt-main".to_string()]);
     }
 }

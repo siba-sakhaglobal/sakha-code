@@ -5,6 +5,7 @@
 //! `crates/crate-work-breakdown.md`. Search/fetch go behind traits with
 //! `Null*`/`Mock*` fallbacks so tests never require live network access.
 
+pub mod compress;
 pub mod evidence;
 pub mod extract;
 pub mod fetch;
@@ -12,6 +13,7 @@ pub mod injection_filter;
 pub mod scoring;
 pub mod search;
 
+pub use compress::{compress_document, compress_documents, default_compressor, CompressedDocument};
 pub use evidence::{Citation, EvidencePack};
 pub use extract::{ExtractedDocument, Extractor, Html2TextExtractor, PlainTextExtractor};
 pub use fetch::{FetchRequest, FetchedPage, MockPageFetcher, NullPageFetcher, PageFetcher, ReqwestPageFetcher};

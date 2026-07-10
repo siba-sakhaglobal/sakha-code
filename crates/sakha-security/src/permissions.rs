@@ -83,6 +83,12 @@ impl PermissionRequest {
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum PermissionDecision {
     Allowed,
+    /// Allowed, with the policy reason preserved for audit trails (spec
+    /// "keep reasons for audit trails"). Behaves identically to `Allowed`
+    /// for every predicate (`is_allowed()` etc.) — the only difference is
+    /// that the reason survives into `SecurityAuditEntry`/logs instead of
+    /// being discarded.
+    AllowedWithReason { reason: String },
     Denied { reason: String },
     NeedsApproval { reason: String },
 }
@@ -90,6 +96,13 @@ pub enum PermissionDecision {
 impl PermissionDecision {
     pub fn allowed() -> Self {
         PermissionDecision::Allowed
+    }
+
+    /// Allowed, but keeping `reason` around (e.g. "allowed by CliFlag policy
+    /// rule '...'") so audit trails can show *why* a request was allowed,
+    /// not just that it was. See spec "keep reasons for audit trails".
+    pub fn allowed_with_reason(reason: impl Into<String>) -> Self {
+        PermissionDecision::AllowedWithReason { reason: reason.into() }
     }
 
     pub fn denied(reason: impl Into<String>) -> Self {
@@ -101,7 +114,7 @@ impl PermissionDecision {
     }
 
     pub fn is_allowed(&self) -> bool {
-        matches!(self, PermissionDecision::Allowed)
+        matches!(self, PermissionDecision::Allowed | PermissionDecision::AllowedWithReason { .. })
     }
 
     pub fn is_denied(&self) -> bool {
@@ -110,5 +123,17 @@ impl PermissionDecision {
 
     pub fn needs_human_approval(&self) -> bool {
         matches!(self, PermissionDecision::NeedsApproval { .. })
+    }
+
+    /// The audit reason attached to this decision, if any. `Allowed`
+    /// (unmatched, risk-based auto-allow) and `AllowedWithReason` differ
+    /// only in whether a policy-rule reason was recorded.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            PermissionDecision::Allowed => None,
+            PermissionDecision::AllowedWithReason { reason }
+            | PermissionDecision::Denied { reason }
+            | PermissionDecision::NeedsApproval { reason } => Some(reason.as_str()),
+        }
     }
 }

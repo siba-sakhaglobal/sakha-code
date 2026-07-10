@@ -10,13 +10,17 @@
 //! create", "SSE reconnect", "Permission decision").
 
 mod api;
+mod compression_routes;
 mod events;
+mod goal_routes;
 mod loop_routes;
 mod permission_queue;
 mod permission_routes;
+mod research_routes;
 mod session_routes;
 mod sse;
 mod state;
+mod tool_routes;
 mod ws;
 
 pub use api::{build_router, ApiError};

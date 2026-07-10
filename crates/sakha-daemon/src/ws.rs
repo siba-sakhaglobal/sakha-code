@@ -10,7 +10,8 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 
-use sakha_core::SessionId;
+use sakha_core::{EventEnvelope, EventKind, SessionId, TurnId};
+use sakha_memory::{SessionStore, TurnRecord};
 
 use crate::state::DaemonState;
 
@@ -47,12 +48,36 @@ async fn handle_socket(mut socket: WebSocket, id: String, state: DaemonState) {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         // Mirror of POST /sessions/:id/input for WS-only clients:
-                        // record the raw text as a turn input and emit a
-                        // TurnStarted event so other subscribers observe it too.
-                        let envelope = sakha_core::EventEnvelope::for_session(
+                        // must both append the turn to the session store *and*
+                        // emit the TurnStarted event, exactly like the REST
+                        // handler, so `GET /sessions/:id/turns` reflects turns
+                        // that came in over the WebSocket too.
+                        let turn_id = TurnId::new();
+                        let append_result = state
+                            .sessions
+                            .append_turn(TurnRecord {
+                                id: turn_id,
+                                session_id,
+                                input_text: text.to_string(),
+                                output_text: None,
+                                created_at: sakha_core::time::now_utc(),
+                            })
+                            .await;
+
+                        if let Err(err) = append_result {
+                            let envelope = EventEnvelope::for_session(
+                                session_id,
+                                EventKind::SessionBlocked,
+                                serde_json::json!({"reason": err.to_string(), "via": "websocket"}),
+                            );
+                            state.emit(envelope);
+                            continue;
+                        }
+
+                        let envelope = EventEnvelope::for_session(
                             session_id,
-                            sakha_core::EventKind::TurnStarted,
-                            serde_json::json!({"input": text, "via": "websocket"}),
+                            EventKind::TurnStarted,
+                            serde_json::json!({"turn_id": turn_id.to_string(), "input": text, "via": "websocket"}),
                         );
                         state.emit(envelope);
                     }

@@ -5,11 +5,21 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use sakha_core::{ArtifactRef, SakhaResult};
+use sakha_core::{ArtifactRef, SakhaError, SakhaResult};
+
+/// Maps a poisoned-mutex error to a non-panicking `SakhaError`. A poisoned
+/// lock means some other task panicked while holding it; rather than
+/// propagating that panic to every future caller, surface it as a fatal
+/// (but catchable) error so normal put/get/evict flow never panics.
+fn poison_err(what: &str) -> SakhaError {
+    SakhaError::fatal("sakha-compression", format!("{what}: lock poisoned by a prior panic"))
+}
 
 /// Current UTC time as unix seconds. Local helper since `sakha-core::time`
-/// only exposes `DateTime<Utc>`, not a raw unix-seconds accessor.
-fn now_unix() -> u64 {
+/// only exposes `DateTime<Utc>`, not a raw unix-seconds accessor. `pub(crate)`
+/// so other compression modules (e.g. `compressor::HeadroomBackedCompressor`)
+/// can stamp markers with the same clock instead of duplicating the logic.
+pub(crate) fn now_unix() -> u64 {
     sakha_core::time::now_utc().timestamp().clamp(0, i64::MAX) as u64
 }
 
@@ -93,24 +103,24 @@ impl InMemoryRetrievalStore {
 #[async_trait]
 impl RetrievalStore for InMemoryRetrievalStore {
     async fn put(&self, marker: CompressionMarker) -> SakhaResult<()> {
-        self.markers.lock().unwrap().insert(marker.id.clone(), marker);
+        self.markers.lock().map_err(|_| poison_err("put"))?.insert(marker.id.clone(), marker);
         Ok(())
     }
 
     async fn get(&self, marker_id: &str) -> SakhaResult<Option<CompressionMarker>> {
-        Ok(self.markers.lock().unwrap().get(marker_id).cloned())
+        Ok(self.markers.lock().map_err(|_| poison_err("get"))?.get(marker_id).cloned())
     }
 
     async fn evict_older_than(&self, max_age_secs: u64) -> SakhaResult<u64> {
         let now = now_unix();
-        let mut markers = self.markers.lock().unwrap();
+        let mut markers = self.markers.lock().map_err(|_| poison_err("evict_older_than"))?;
         let before = markers.len();
         markers.retain(|_, marker| now.saturating_sub(marker.created_at_unix) <= max_age_secs);
         Ok((before - markers.len()) as u64)
     }
 
     async fn len(&self) -> SakhaResult<usize> {
-        Ok(self.markers.lock().unwrap().len())
+        Ok(self.markers.lock().map_err(|_| poison_err("len"))?.len())
     }
 }
 

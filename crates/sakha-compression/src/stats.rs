@@ -5,6 +5,15 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+/// Maps a poisoned-mutex error to a non-panicking fallback: rather than
+/// propagating a prior panic to every future caller of `record`/`get`, log
+/// and fall back to an empty snapshot / no-op record. Compression stats are
+/// diagnostic, not correctness-critical, so fail-open here rather than
+/// panicking during compression's hot path.
+fn on_poisoned(what: &str) {
+    tracing::error!(what, "StatsRecorder mutex poisoned by a prior panic; continuing with degraded stats");
+}
+
 /// What scope `CompressionStats` are being reported for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CompressionScope {
@@ -78,7 +87,13 @@ impl StatsRecorder {
     }
 
     fn record(&self, scope: CompressionScope, delta: CompressionStats) {
-        let mut map = self.by_scope.lock().unwrap();
+        let mut map = match self.by_scope.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                on_poisoned("record");
+                poisoned.into_inner()
+            }
+        };
         let entry = map.entry(scope.clone()).or_default();
         *entry = entry.merge(delta);
         // Avoid double-counting when the caller already recorded directly
@@ -129,7 +144,14 @@ impl StatsRecorder {
     }
 
     pub fn get(&self, scope: &CompressionScope) -> CompressionStats {
-        self.by_scope.lock().unwrap().get(scope).copied().unwrap_or_default()
+        let map = match self.by_scope.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                on_poisoned("get");
+                poisoned.into_inner()
+            }
+        };
+        map.get(scope).copied().unwrap_or_default()
     }
 }
 

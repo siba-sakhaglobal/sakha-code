@@ -42,7 +42,13 @@ pub fn execute(command: ConfigCommand) -> i32 {
                     match args.output {
                         OutputFormat::Json => {
                             let payload = serde_json::json!({ "key": args.key, "value": value });
-                            println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                            match serde_json::to_string_pretty(&payload) {
+                                Ok(json) => println!("{json}"),
+                                Err(err) => {
+                                    print_error(&format!("failed to serialize config value: {err}"), args.output);
+                                    return 1;
+                                }
+                            }
                         }
                         OutputFormat::Text => println!("{value}"),
                     }
@@ -73,7 +79,13 @@ pub fn execute(command: ConfigCommand) -> i32 {
             match args.output {
                 OutputFormat::Json => {
                     let payload = serde_json::json!({ "key": args.key, "value": args.value, "path": path.display().to_string() });
-                    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                    match serde_json::to_string_pretty(&payload) {
+                        Ok(json) => println!("{json}"),
+                        Err(err) => {
+                            print_error(&format!("failed to serialize config value: {err}"), args.output);
+                            return 1;
+                        }
+                    }
                 }
                 OutputFormat::Text => println!("set {} = {} ({})", args.key, args.value, path.display()),
             }
@@ -87,21 +99,8 @@ mod tests {
     use super::*;
 
     fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
-        let dir = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_profile = std::env::var("USERPROFILE").ok();
-        std::env::set_var("HOME", dir.path());
-        std::env::set_var("USERPROFILE", dir.path());
-        let result = f();
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_profile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        result
+        let _home = crate::test_support::TempHome::new();
+        f()
     }
 
     #[test]

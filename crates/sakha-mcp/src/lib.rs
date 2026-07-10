@@ -4,19 +4,27 @@
 //! and `crates/crate-work-breakdown.md`.
 
 pub mod client;
+pub mod connector;
 pub mod jsonrpc;
+pub mod mcp_server;
+pub mod plugin;
 pub mod server_registry;
 pub mod tool_bridge;
 pub mod transport;
 pub mod trust;
 
 pub use client::{
-    DefaultMcpClientManager, McpClientManager, McpConnection, McpResourceDescriptor, McpToolDescriptor,
+    DefaultMcpClientManager, McpClient, McpClientManager, McpConnection, McpResourceDescriptor, McpToolDescriptor,
     MCP_PROTOCOL_VERSION,
 };
-pub use server_registry::{McpServerConfig, McpServerRegistry};
-pub use tool_bridge::{namespaced_tool_name, McpProxyTool, McpToolBridge};
-pub use transport::{DisconnectedTransport, FakeTransport, McpTransport, RpcMessage, StdioTransport, TransportKind};
+pub use connector::{check_connector_permission, compress_connector_output, Connector, ConnectorCredentialRef, ConnectorPolicy, ConnectorRegistry};
+pub use mcp_server::SakhaMcpServer;
+pub use plugin::{PluginAuditEntry, PluginManifest, PluginRegistry, RegisteredPlugin};
+pub use server_registry::{McpServerConfig, McpServerManager, McpServerRegistry};
+pub use tool_bridge::{namespaced_resource_tool_name, namespaced_tool_name, McpResourceProxy, McpResourceProxyTool, McpToolBridge, McpToolProxy};
+pub use transport::{
+    DisconnectedTransport, FakeTransport, HttpSseTransport, McpTransport, RpcMessage, StdioTransport, TransportKind,
+};
 pub use trust::{TrustLevel, TrustPolicy};
 
 pub fn crate_name() -> &'static str {

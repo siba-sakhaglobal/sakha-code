@@ -104,12 +104,24 @@ pub struct HttpHeadroomClient {
 }
 
 impl HttpHeadroomClient {
-    pub fn new(config: HeadroomHttpConfig) -> Self {
+    /// Builds the underlying `reqwest::Client`. Fallible because a malformed
+    /// `HeadroomHttpConfig` (e.g. an invalid TLS/proxy setup) must surface as
+    /// a configuration error rather than silently degrading to an
+    /// unbounded-timeout client, which would mask the misconfiguration.
+    pub fn try_new(config: HeadroomHttpConfig) -> SakhaResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self { config, client }
+            .map_err(|err| SakhaError::fatal("sakha-compression", "failed to build Headroom HTTP client").with_cause(err))?;
+        Ok(Self { config, client })
+    }
+
+    /// Convenience constructor for callers that accept a panic on
+    /// misconfiguration (e.g. `main()` at startup, where failing fast is
+    /// correct). Prefer `try_new` in library code and anywhere an error
+    /// should propagate instead of aborting the process.
+    pub fn new(config: HeadroomHttpConfig) -> Self {
+        Self::try_new(config).expect("failed to build Headroom HTTP client")
     }
 
     fn url(&self, path: &str) -> String {
@@ -204,23 +216,59 @@ impl HeadroomClient for HttpHeadroomClient {
 }
 
 /// Manages the lifecycle of a locally-run Headroom sidecar process (spawn,
-/// health-check, shutdown). Stub: no process is actually spawned yet; use
-/// `crate::sidecar::SidecarLauncher` once that grows a real implementation.
-#[derive(Debug, Default)]
+/// health-check, shutdown), delegating the actual process spawn/health-poll
+/// to `crate::sidecar::SidecarLauncher`. A failed `start()` (no binary
+/// configured, spawn failure, health-check timeout) is a normal, handled
+/// outcome — never a panic — so callers fall back to
+/// `LocalFallbackCompressor` per the "Headroom unavailable" failure mode.
 pub struct HeadroomSidecar {
     pub running: bool,
+    launcher: crate::sidecar::SidecarLauncher,
+    client: Option<HttpHeadroomClient>,
+}
+
+impl std::fmt::Debug for HeadroomSidecar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadroomSidecar").field("running", &self.running).finish()
+    }
+}
+
+impl Default for HeadroomSidecar {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HeadroomSidecar {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_config(crate::sidecar::SidecarConfig::default())
     }
 
+    pub fn with_config(config: crate::sidecar::SidecarConfig) -> Self {
+        Self { running: false, launcher: crate::sidecar::SidecarLauncher::new(config), client: None }
+    }
+
+    /// Spawns the sidecar binary and waits for it to become healthy,
+    /// returning once an `HttpHeadroomClient` can reach it. Errors (no
+    /// `binary_path` configured, spawn failure, health-check timeout) are
+    /// surfaced as `SakhaResult` per module 05 "Failure Modes": Headroom
+    /// unavailable — never a panic.
     pub async fn start(&mut self) -> SakhaResult<()> {
-        Err(SakhaError::not_implemented("sakha-compression", "HeadroomSidecar::start"))
+        let client = self.launcher.launch().await?;
+        self.client = Some(client);
+        self.running = true;
+        Ok(())
+    }
+
+    /// The `HttpHeadroomClient` for the running sidecar, if `start()` has
+    /// succeeded.
+    pub fn client(&self) -> Option<&HttpHeadroomClient> {
+        self.client.as_ref()
     }
 
     pub async fn stop(&mut self) -> SakhaResult<()> {
+        self.launcher.shutdown().await?;
+        self.client = None;
         self.running = false;
         Ok(())
     }
@@ -271,5 +319,21 @@ mod tests {
         };
         let client = HttpHeadroomClient::new(config);
         assert_eq!(client.url("/headroom_compress"), "http://localhost:8787/headroom_compress");
+    }
+
+    /// `HeadroomSidecar::start()` with no binary configured must fail
+    /// gracefully (not panic), leaving `running` false so callers fall back
+    /// to `LocalFallbackCompressor` per the "Headroom unavailable" failure
+    /// mode (spec "Tests": Headroom unavailable).
+    #[tokio::test]
+    async fn sidecar_start_without_binary_fails_open_not_panic() {
+        let mut sidecar = HeadroomSidecar::new();
+        let result = sidecar.start().await;
+        assert!(result.is_err());
+        assert!(!sidecar.running);
+        assert!(sidecar.client().is_none());
+
+        // stop() is always a safe no-op, even after a failed start.
+        assert!(sidecar.stop().await.is_ok());
     }
 }

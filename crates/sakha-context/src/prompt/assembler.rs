@@ -161,8 +161,6 @@ impl PromptAssembler for DefaultPromptAssembler {
                 volatile: false,
             });
         }
-        let cache_prefix_len: u32 = sections.iter().map(|s| s.content.len() as u32).sum();
-
         sections.push(PromptSection {
             id: SectionId::new("user_input"),
             priority: priority::USER_INPUT,
@@ -181,14 +179,22 @@ impl PromptAssembler for DefaultPromptAssembler {
             None => sections,
         };
 
-        // Recompute cache_prefix_len from the surviving non-volatile
-        // sections in case trimming dropped some of them.
-        let cache_prefix_len = sections
+        // `render()` joins section contents with a `"\n\n"` separator, so the
+        // cache-friendly prefix of the rendered string must include the
+        // separator bytes between non-volatile sections too — otherwise
+        // `render()[..cache_prefix_len]` cuts a few bytes short of the true
+        // stable prefix, which is what providers actually hash for prompt
+        // caching. Only *between* non-volatile sections does a separator
+        // belong to the prefix; the separator right before the first volatile
+        // section is not part of the stable prefix.
+        const SEPARATOR_LEN: u32 = 2; // "\n\n"
+        let non_volatile_count = sections.iter().take_while(|s| !s.volatile).count();
+        let cache_prefix_len: u32 = sections
             .iter()
-            .take_while(|s| !s.volatile)
+            .take(non_volatile_count)
             .map(|s| s.content.len() as u32)
             .sum::<u32>()
-            .min(cache_prefix_len);
+            + non_volatile_count.saturating_sub(1) as u32 * SEPARATOR_LEN;
         let token_estimate: u32 = sections.iter().map(|s| (s.content.len() as u32) / 4).sum();
 
         Ok(AssembledPrompt { sections, token_estimate, cache_prefix_len })

@@ -112,9 +112,7 @@ mod tests {
 
     #[test]
     fn doctor_with_mock_provider_reports_all_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
-        std::env::set_var("USERPROFILE", dir.path());
+        let _home = crate::test_support::TempHome::new();
         let code = execute(OutputFormat::Json);
         assert_eq!(code, 0);
     }

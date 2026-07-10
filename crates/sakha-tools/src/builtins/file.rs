@@ -21,6 +21,13 @@ const MODULE: &str = "sakha-tools::file";
 /// Maximum bytes returned inline by `file.read` before truncation.
 const MAX_READ_BYTES: usize = 512 * 1024;
 
+/// Maximum number of entries returned by a recursive `file.list`, and the
+/// maximum directory depth walked, so a recursive listing over a huge tree
+/// can never produce unbounded output or walk indefinitely (spec: keep tool
+/// output bounded / budget-enforced).
+const MAX_LIST_ENTRIES: usize = 2000;
+const MAX_LIST_DEPTH: usize = 64;
+
 fn default_summary(result: &ToolResult) -> ToolSummary {
     let text = match &result.error_message {
         Some(msg) => msg.clone(),
@@ -477,7 +484,10 @@ impl Tool for FileListTool {
             })),
             output_schema: ToolOutputSchema(serde_json::json!({
                 "type": "object",
-                "properties": {"entries": {"type": "array"}}
+                "properties": {
+                    "entries": {"type": "array"},
+                    "truncated": {"type": "boolean"}
+                }
             })),
             permission_spec: ToolPermissionSpec {
                 required: vec![PermissionKind::FileRead],
@@ -501,10 +511,19 @@ impl Tool for FileListTool {
         let resolved = resolve_in_workspace(&context.workspace_root, path_str)?;
 
         let mut entries = Vec::new();
+        let mut truncated = false;
         if recursive {
-            for entry in walkdir::WalkDir::new(&resolved).into_iter().filter_map(|e| e.ok()) {
+            let walker = walkdir::WalkDir::new(&resolved)
+                .max_depth(MAX_LIST_DEPTH)
+                .into_iter()
+                .filter_map(|e| e.ok());
+            for entry in walker {
                 if entry.path() == resolved {
                     continue;
+                }
+                if entries.len() >= MAX_LIST_ENTRIES {
+                    truncated = true;
+                    break;
                 }
                 entries.push(serde_json::json!({
                     "path": entry.path().to_string_lossy(),
@@ -520,6 +539,10 @@ impl Tool for FileListTool {
                 .await
                 .map_err(|e| SakhaError::invalid_input(MODULE, format!("list failed: {e}")))?
             {
+                if entries.len() >= MAX_LIST_ENTRIES {
+                    truncated = true;
+                    break;
+                }
                 let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
                 entries.push(serde_json::json!({
                     "path": entry.path().to_string_lossy(),
@@ -528,7 +551,10 @@ impl Tool for FileListTool {
             }
         }
 
-        Ok(ToolResult::success(serde_json::json!({"entries": entries})))
+        Ok(ToolResult::success(serde_json::json!({
+            "entries": entries,
+            "truncated": truncated,
+        })))
     }
 
     fn summarize(&self, result: &ToolResult) -> ToolSummary {
@@ -691,6 +717,24 @@ mod tests {
         let result = tool.execute(&input, &context).await.unwrap();
         let entries = result.output_json["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recursive_list_is_bounded_and_reports_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ctx(dir.path());
+
+        // Create more files than MAX_LIST_ENTRIES so the walk must truncate.
+        for i in 0..(super::MAX_LIST_ENTRIES + 25) {
+            tokio::fs::write(dir.path().join(format!("f{i}.txt")), "x").await.unwrap();
+        }
+
+        let tool = FileListTool;
+        let input = tool.validate(serde_json::json!({"recursive": true})).unwrap();
+        let result = tool.execute(&input, &context).await.unwrap();
+        let entries = result.output_json["entries"].as_array().unwrap();
+        assert!(entries.len() <= super::MAX_LIST_ENTRIES);
+        assert_eq!(result.output_json["truncated"], true);
     }
 
     #[test]

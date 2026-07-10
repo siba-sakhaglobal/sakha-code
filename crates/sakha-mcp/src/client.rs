@@ -32,6 +32,13 @@ pub struct McpResourceDescriptor {
 /// Protocol version Sakha speaks when initializing an MCP session.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Spec-facing alias: `crate-work-breakdown.md` names this type `McpClient`.
+/// `McpConnection` is kept as the primary name (it more precisely describes
+/// "one live connection to one server", as opposed to a manager over many),
+/// but `McpClient` is exported so the public API surface matches the spec
+/// contract directly.
+pub type McpClient = McpConnection;
+
 /// A single MCP client connection: handshake, discovery, and tool
 /// invocation against one server.
 pub struct McpConnection {
@@ -152,6 +159,23 @@ impl McpConnection {
             return Err(SakhaError::invalid_input("sakha-mcp", format!("MCP tool '{name}' failed: {message}")));
         }
         Ok(result)
+    }
+
+    /// Reads a single MCP resource by URI via `resources/read`.
+    pub async fn read_resource(&self, uri: &str) -> SakhaResult<serde_json::Value> {
+        self.require_initialized()?;
+        let params = serde_json::json!({ "uri": uri });
+        self.call("resources/read", Some(params)).await
+    }
+}
+
+/// Lets a live `McpConnection` drive `sakha_compression::HeadroomMcpClient`
+/// directly (spec "MCP mode": expose/use Headroom MCP tools), without
+/// `sakha-compression` needing to depend on `sakha-mcp`'s concrete types.
+#[async_trait]
+impl sakha_compression::McpToolInvoker for McpConnection {
+    async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> SakhaResult<serde_json::Value> {
+        McpConnection::call_tool(self, name, arguments).await
     }
 }
 

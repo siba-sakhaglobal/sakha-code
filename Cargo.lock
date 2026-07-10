@@ -1718,6 +1718,7 @@ name = "sakha-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "dirs",
  "sakha-agent",
@@ -1746,6 +1747,7 @@ dependencies = [
  "async-trait",
  "reqwest",
  "sakha-core",
+ "sakha-security",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1795,12 +1797,14 @@ dependencies = [
  "chrono",
  "futures",
  "sakha-agent",
+ "sakha-compression",
  "sakha-context",
  "sakha-core",
  "sakha-loop",
  "sakha-memory",
  "sakha-observability",
  "sakha-provider",
+ "sakha-research",
  "sakha-security",
  "sakha-tools",
  "serde",
@@ -1839,6 +1843,9 @@ name = "sakha-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
+ "reqwest",
+ "sakha-compression",
  "sakha-core",
  "sakha-security",
  "sakha-tools",
@@ -1846,8 +1853,10 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1910,6 +1919,7 @@ dependencies = [
  "chrono",
  "html2text",
  "reqwest",
+ "sakha-compression",
  "sakha-core",
  "sakha-security",
  "serde",

@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use clap::Args;
 
-use sakha_memory::{InMemorySessionStore, SessionRecord, SessionStatus, SessionStore, TurnRecord};
+use sakha_memory::{SessionRecord, SessionStatus, SessionStore, TurnRecord};
 use sakha_provider::{MessageRole, ModelMessage, ModelRequest};
 
 use crate::config::{default_config_path, load_config};
 use crate::output::{print_error, OutputFormat};
-use crate::runtime::{build_provider, stream_to_completion};
+use crate::runtime::{build_provider, build_session_store, build_tool_registry, run_agent_turn};
 
 #[derive(Debug, Args)]
 pub struct ChatArgs {
@@ -27,8 +27,12 @@ pub struct ChatArgs {
 
 /// Starts an interactive chat loop: reads prompts from stdin (one per line,
 /// `exit`/`quit` to leave), streams the model's reply to stdout, and records
-/// each turn. Uses an in-process session store; durable SQLite persistence is
-/// available via `sakha session` once a `db_path` is configured.
+/// each turn. Uses `build_session_store` (SQLite-backed, durable across
+/// process restarts, when `config.db_path` is set; in-memory otherwise), so
+/// `--session-id <id>` actually resumes a prior session's turn history once a
+/// `db_path` is configured — the in-memory fallback is documented, not
+/// silently misleading: without a `db_path`, "resume" starts a fresh session
+/// under the given id since there is nothing durable to load.
 pub fn execute(args: ChatArgs) -> i32 {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -51,7 +55,14 @@ async fn chat_async(args: ChatArgs, input: &mut impl BufRead, out: &mut impl Wri
     };
 
     let provider = build_provider(&config);
-    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let registry = build_tool_registry();
+    let store: Arc<dyn SessionStore> = match build_session_store(&config) {
+        Ok(store) => store,
+        Err(err) => {
+            print_error(&format!("failed to open session store: {err}"), args.output);
+            return 1;
+        }
+    };
 
     let session_id = match &args.session_id {
         Some(raw) => match raw.parse::<sakha_core::SessionId>() {
@@ -112,10 +123,21 @@ async fn chat_async(args: ChatArgs, input: &mut impl BufRead, out: &mut impl Wri
             name: None,
         });
 
-        let result = stream_to_completion(provider.as_ref(), request, |chunk| {
-            let _ = write!(out, "{chunk}");
-            let _ = out.flush();
-        })
+        let out_cell = std::cell::RefCell::new(&mut *out);
+        let result = run_agent_turn(
+            provider.as_ref(),
+            &registry,
+            request,
+            |chunk| {
+                let mut out = out_cell.borrow_mut();
+                let _ = write!(out, "{chunk}");
+                let _ = out.flush();
+            },
+            |tool_name, succeeded| {
+                let mut out = out_cell.borrow_mut();
+                let _ = writeln!(out, "[tool] {tool_name}: {}", if succeeded { "ok" } else { "failed" });
+            },
+        )
         .await;
 
         match result {
@@ -160,9 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_echoes_mock_response_and_exits_on_quit() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
-        std::env::set_var("USERPROFILE", dir.path());
+        let _home = crate::test_support::TempHome::new();
 
         let mut input = Cursor::new(b"hello there\nexit\n".to_vec());
         let mut out = Vec::new();
@@ -176,13 +196,52 @@ mod tests {
 
     #[tokio::test]
     async fn chat_handles_immediate_eof_gracefully() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
-        std::env::set_var("USERPROFILE", dir.path());
+        let _home = crate::test_support::TempHome::new();
 
         let mut input = Cursor::new(Vec::new());
         let mut out = Vec::new();
         let code = chat_async(ChatArgs { session_id: None, output: OutputFormat::Text }, &mut input, &mut out).await;
         assert_eq!(code, 0);
+    }
+
+    /// With a durable `db_path` configured, a `--session-id` resume across
+    /// two separate `chat_async` invocations must see the first
+    /// invocation's turn recorded — proving resume actually loads prior
+    /// state rather than silently starting fresh each time (spec: "sakha
+    /// chat --session-id claims to resume").
+    #[tokio::test]
+    async fn chat_with_configured_db_path_persists_session_across_invocations() {
+        let home = crate::test_support::TempHome::new();
+
+        let db_path = home.path().join("chat-sessions.sqlite3");
+        let mut config = crate::config::SakhaConfig::default();
+        config.db_path = Some(db_path.to_string_lossy().to_string());
+        crate::config::save_config(&crate::config::default_config_path(), &config).unwrap();
+
+        let session_id = sakha_core::SessionId::new();
+        let args = ChatArgs { session_id: Some(session_id.to_string()), output: OutputFormat::Text };
+
+        let mut first_input = Cursor::new(b"remember this\nexit\n".to_vec());
+        let mut first_out = Vec::new();
+        let first_code = chat_async(
+            ChatArgs { session_id: Some(session_id.to_string()), output: OutputFormat::Text },
+            &mut first_input,
+            &mut first_out,
+        )
+        .await;
+        assert_eq!(first_code, 0);
+
+        // A second invocation resuming the same session id must find it
+        // already created (durable store), not create a brand-new session.
+        let mut second_input = Cursor::new(b"exit\n".to_vec());
+        let mut second_out = Vec::new();
+        let second_code = chat_async(args, &mut second_input, &mut second_out).await;
+        assert_eq!(second_code, 0);
+
+        // Verify via the store directly that the turn from the first
+        // invocation persisted under this session id.
+        let store = build_session_store(&config).unwrap();
+        let turns = store.list_turns(session_id).await.unwrap();
+        assert!(turns.iter().any(|t| t.input_text == "remember this"));
     }
 }

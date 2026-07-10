@@ -9,7 +9,7 @@ use sakha_provider::{MessageRole, ModelMessage, ModelRequest, StopReason};
 
 use crate::config::{default_config_path, load_config};
 use crate::output::{print_error, OutputFormat};
-use crate::runtime::{build_provider, stream_to_completion};
+use crate::runtime::{build_provider, build_tool_registry, run_agent_turn};
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -59,6 +59,7 @@ async fn run_async(args: RunArgs) -> i32 {
     }
 
     let provider = build_provider(&config);
+    let registry = build_tool_registry();
 
     let mut request = ModelRequest::new(config.provider.model.clone());
     request.messages.push(ModelMessage {
@@ -70,12 +71,22 @@ async fn run_async(args: RunArgs) -> i32 {
 
     let output = args.output;
     let text_mode = matches!(output, OutputFormat::Text);
-    let result = stream_to_completion(provider.as_ref(), request, |chunk| {
-        if text_mode {
-            print!("{chunk}");
-            let _ = std::io::stdout().flush();
-        }
-    })
+    let result = run_agent_turn(
+        provider.as_ref(),
+        &registry,
+        request,
+        |chunk| {
+            if text_mode {
+                print!("{chunk}");
+                let _ = std::io::stdout().flush();
+            }
+        },
+        |tool_name, succeeded| {
+            if text_mode {
+                eprintln!("[tool] {tool_name}: {}", if succeeded { "ok" } else { "failed" });
+            }
+        },
+    )
     .await;
 
     match result {
@@ -90,7 +101,13 @@ async fn run_async(args: RunArgs) -> i32 {
                         "response": text,
                         "stop_reason": stop_reason,
                     });
-                    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                    match serde_json::to_string_pretty(&payload) {
+                        Ok(json) => println!("{json}"),
+                        Err(err) => {
+                            print_error(&format!("failed to serialize run output: {err}"), output);
+                            return exit_code::MODEL_ERROR;
+                        }
+                    }
                 }
             }
             match stop_reason {
@@ -132,37 +149,10 @@ mod tests {
     #[test]
     fn run_with_mock_provider_exits_success() {
         // Force a mock-provider run regardless of any real ~/.sakha/config.toml
-        // on the host by pointing the home directory at an empty temp dir for
-        // the duration of this test. `dirs::home_dir()` reads `USERPROFILE` on
-        // Windows and `HOME` elsewhere, so override both.
-        let dir = tempfile::tempdir().unwrap();
-        let _guard_home = EnvVarGuard::set("HOME", dir.path());
-        let _guard_profile = EnvVarGuard::set("USERPROFILE", dir.path());
+        // on the host by pointing the config directory at an empty temp dir
+        // for the duration of this test.
+        let _home = crate::test_support::TempHome::new();
         let code = execute(RunArgs { prompt: "hello".into(), output: OutputFormat::Json, model: None });
         assert_eq!(code, exit_code::SUCCESS);
-    }
-
-    /// Minimal RAII env-var guard so tests don't leak env overrides into
-    /// other tests running in the same process.
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::path::Path>) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value.as_ref());
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
     }
 }

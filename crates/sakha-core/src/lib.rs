@@ -10,6 +10,7 @@ pub mod error;
 pub mod event;
 pub mod id;
 pub mod retry;
+pub mod runtime;
 pub mod time;
 
 pub use artifact::{ArtifactKind, ArtifactRef};
@@ -21,3 +22,4 @@ pub use id::{
     SessionId, ToolCallId, TurnId, WorkspaceId,
 };
 pub use retry::{ExponentialBackoff, RetryAfterOrBackoff, RetryPolicy};
+pub use runtime::{CancellationToken, EventBus, EventSink, EventStream, RuntimeError};

@@ -15,7 +15,7 @@ pub use event_queue::{InMemoryLoopQueue, LeasedMessage, LoopQueue, QueueMessage}
 pub use replay::{LoopSkill, LoopSkillRecorder, ReplayEngine, ReplayStep, ReplayTrace};
 pub use runtime::{
     ApprovalStatus, ApprovalStore, FeedbackRecord, FeedbackSource, InMemoryApprovalStore, LoopBudget, LoopController,
-    LoopRuntime, LoopState, LoopTick, LoopTickResult, NullTickExecutor, StopReason, TickExecutor, TickOutcome,
+    LoopRuntime, LoopState, LoopSummary, LoopTick, LoopTickResult, NullTickExecutor, StopReason, TickExecutor, TickOutcome,
 };
 pub use scheduler::{ImmediateScheduler, IntervalCronScheduler, ParsedSchedule, Scheduler};
 pub use spec::{

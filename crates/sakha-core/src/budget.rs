@@ -37,6 +37,9 @@ pub enum BudgetDimension {
     OutputTokens,
     CostMicros,
     ToolCalls,
+    /// Wall-clock time consumed, in milliseconds. Debited by callers as
+    /// elapsed time accrues; compared against `Budget::max_wall_time`.
+    WallTime,
     LoopIterations,
     FilesystemWrites,
 }
@@ -51,11 +54,20 @@ pub struct BudgetLedger {
     output_tokens: AtomicU64,
     cost_micros: AtomicU64,
     tool_calls: AtomicU64,
+    wall_time_millis: AtomicU64,
     loop_iterations: AtomicU64,
     filesystem_writes: AtomicU64,
     /// Signed so credits (refunds) beyond zero don't panic; clamped at read time.
     _reserved: AtomicI64,
 }
+
+/// Upper bound on compare-exchange retry attempts for `debit`/`credit`
+/// before giving up. Under real contention (a handful of concurrent
+/// tool/model tasks sharing one ledger) a CAS loop converges in a handful of
+/// iterations; this cap exists purely so a pathological/adversarial amount
+/// of concurrent interference can never spin a thread forever, per the
+/// "unbounded loops without budget checks" principle.
+const MAX_CAS_ATTEMPTS: u32 = 10_000;
 
 impl BudgetLedger {
     pub fn new(limits: Budget) -> Self {
@@ -65,6 +77,7 @@ impl BudgetLedger {
             output_tokens: AtomicU64::new(0),
             cost_micros: AtomicU64::new(0),
             tool_calls: AtomicU64::new(0),
+            wall_time_millis: AtomicU64::new(0),
             loop_iterations: AtomicU64::new(0),
             filesystem_writes: AtomicU64::new(0),
             _reserved: AtomicI64::new(0),
@@ -77,6 +90,7 @@ impl BudgetLedger {
             BudgetDimension::OutputTokens => &self.output_tokens,
             BudgetDimension::CostMicros => &self.cost_micros,
             BudgetDimension::ToolCalls => &self.tool_calls,
+            BudgetDimension::WallTime => &self.wall_time_millis,
             BudgetDimension::LoopIterations => &self.loop_iterations,
             BudgetDimension::FilesystemWrites => &self.filesystem_writes,
         }
@@ -88,6 +102,7 @@ impl BudgetLedger {
             BudgetDimension::OutputTokens => self.limits.max_output_tokens,
             BudgetDimension::CostMicros => self.limits.max_cost_micros,
             BudgetDimension::ToolCalls => self.limits.max_tool_calls,
+            BudgetDimension::WallTime => self.limits.max_wall_time.map(|d| d.as_millis() as u64),
             BudgetDimension::LoopIterations => self.limits.max_loop_iterations,
             BudgetDimension::FilesystemWrites => self.limits.max_filesystem_writes,
         }
@@ -95,10 +110,16 @@ impl BudgetLedger {
 
     /// Attempts to debit `amount` from `dim`. Returns `Err(SakhaError::Budget)`
     /// without mutating state if the debit would exceed the configured limit.
+    ///
+    /// The compare-exchange retry loop is bounded by `MAX_CAS_ATTEMPTS`: if
+    /// contention prevents the CAS from ever winning within that many
+    /// attempts, this returns a non-retryable `SakhaError::Fatal` rather than
+    /// spinning indefinitely (see module principle "no unbounded loops
+    /// without a budget/iteration check").
     pub fn debit(&self, dim: BudgetDimension, amount: u64) -> Result<(), SakhaError> {
         let counter = self.counter(dim);
         let limit = self.limit(dim);
-        loop {
+        for _ in 0..MAX_CAS_ATTEMPTS {
             let current = counter.load(Ordering::SeqCst);
             let next = current.saturating_add(amount);
             if let Some(limit) = limit {
@@ -119,14 +140,24 @@ impl BudgetLedger {
             }
             // CAS lost the race; retry.
         }
+        Err(SakhaError::fatal(
+            "sakha-core",
+            format!("budget ledger debit for {dim:?} could not make progress after {MAX_CAS_ATTEMPTS} attempts (contention)"),
+        ))
     }
 
     /// Credits (refunds) `amount` back to `dim`, e.g. when a retry is charged
     /// against the same ledger but the operation is later voided. Never goes
     /// below zero.
+    ///
+    /// Like `debit`, the retry loop is bounded by `MAX_CAS_ATTEMPTS`; if the
+    /// CAS cannot win within that many attempts under contention, the credit
+    /// is silently dropped rather than looping forever. A missed refund is
+    /// recoverable (the ledger just stays slightly more conservative); an
+    /// unbounded spin is not.
     pub fn credit(&self, dim: BudgetDimension, amount: u64) {
         let counter = self.counter(dim);
-        loop {
+        for _ in 0..MAX_CAS_ATTEMPTS {
             let current = counter.load(Ordering::SeqCst);
             let next = current.saturating_sub(amount);
             if counter
@@ -212,6 +243,53 @@ mod tests {
         ledger.debit(BudgetDimension::LoopIterations, 2).unwrap();
         assert!(ledger.is_exhausted(BudgetDimension::LoopIterations));
         assert_eq!(ledger.remaining(BudgetDimension::LoopIterations), Some(0));
+    }
+
+    #[test]
+    fn wall_time_dimension_is_tracked_against_max_wall_time() {
+        let ledger = BudgetLedger::new(Budget {
+            max_wall_time: Some(Duration::from_secs(2)),
+            ..Budget::unlimited()
+        });
+        assert!(ledger.debit(BudgetDimension::WallTime, 1_500).is_ok());
+        assert_eq!(ledger.used(BudgetDimension::WallTime), 1_500);
+        // A further debit that would push past the 2000ms limit must fail
+        // and must not mutate the counter.
+        let result = ledger.debit(BudgetDimension::WallTime, 600);
+        assert!(result.is_err());
+        assert_eq!(ledger.used(BudgetDimension::WallTime), 1_500);
+    }
+
+    /// Spec requirement (`01-core-runtime.md` "Tests": "Budget exhaustion
+    /// stops loop"): once a dimension's limit is reached, a loop driven by
+    /// that ledger must halt (via an `Err` from `debit`) rather than keep
+    /// iterating.
+    #[test]
+    fn budget_exhaustion_stops_loop() {
+        let ledger = BudgetLedger::new(Budget {
+            max_loop_iterations: Some(3),
+            ..Budget::unlimited()
+        });
+
+        let mut completed_iterations = 0u64;
+        let stop_reason = loop {
+            match ledger.debit(BudgetDimension::LoopIterations, 1) {
+                Ok(()) => {
+                    completed_iterations += 1;
+                    // Safety valve so a bug in this test can't hang the
+                    // suite: a correctly-behaving ledger will error out at
+                    // iteration 4, long before this fires.
+                    if completed_iterations > 1000 {
+                        panic!("loop did not stop when budget was exhausted");
+                    }
+                }
+                Err(err) => break err,
+            }
+        };
+
+        assert_eq!(completed_iterations, 3);
+        assert!(ledger.is_exhausted(BudgetDimension::LoopIterations));
+        assert_eq!(stop_reason.class, crate::error::ErrorClass::Budget);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::permissions::{PermissionDecision, PermissionRequest};
+use sakha_core::SakhaError;
 
 /// One recorded permission evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +56,37 @@ impl SecurityAudit {
     pub fn denied_count(&self) -> usize {
         self.entries.iter().filter(|e| e.decision.is_denied()).count()
     }
+
+    /// Serializes the full audit trail to a JSON array, per spec task #10
+    /// "Implement security audit exports". Suitable for writing to a file or
+    /// shipping to an external audit system (`sakha-observability`'s
+    /// exporter, a SIEM, etc.).
+    pub fn export_json(&self) -> Result<String, SakhaError> {
+        serde_json::to_string_pretty(&self.entries)
+            .map_err(|e| SakhaError::integrity("sakha-security", "failed to serialize audit export").with_cause(e))
+    }
+
+    /// Serializes the audit trail as JSON Lines (one `SecurityAuditEntry` per
+    /// line), the common shape for append-only audit log files and streaming
+    /// ingestion into external log/audit systems.
+    pub fn export_jsonl(&self) -> Result<String, SakhaError> {
+        let mut out = String::new();
+        for entry in &self.entries {
+            let line = serde_json::to_string(entry)
+                .map_err(|e| SakhaError::integrity("sakha-security", "failed to serialize audit entry").with_cause(e))?;
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Writes the audit trail to `path` as JSON (pretty-printed array), per
+    /// spec "Implement security audit exports" -> "export audit to files".
+    pub fn export_to_file(&self, path: impl AsRef<std::path::Path>) -> Result<(), SakhaError> {
+        let json = self.export_json()?;
+        std::fs::write(path, json)
+            .map_err(|e| SakhaError::integrity("sakha-security", "failed to write audit export file").with_cause(e))
+    }
 }
 
 #[cfg(test)]
@@ -73,5 +105,55 @@ mod tests {
 
         assert_eq!(audit.len(), 2);
         assert_eq!(audit.denied_count(), 1);
+    }
+
+    #[test]
+    fn export_json_round_trips_all_entries() {
+        let mut audit = SecurityAudit::new();
+        let req = PermissionRequest::new(PermissionKind::FileRead, "a.txt", "read");
+        audit.record(&req, &PermissionDecision::allowed());
+
+        let json = audit.export_json().unwrap();
+        let parsed: Vec<SecurityAuditEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].subject, "a.txt");
+    }
+
+    #[test]
+    fn export_jsonl_writes_one_entry_per_line() {
+        let mut audit = SecurityAudit::new();
+        audit.record(&PermissionRequest::new(PermissionKind::FileRead, "a.txt", "read"), &PermissionDecision::allowed());
+        audit.record(
+            &PermissionRequest::new(PermissionKind::ShellRunArbitrary, "rm -rf /", "run"),
+            &PermissionDecision::denied("blocked"),
+        );
+
+        let jsonl = audit.export_jsonl().unwrap();
+        let lines: Vec<&str> = jsonl.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let _: SecurityAuditEntry = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn export_to_file_writes_readable_json() {
+        let mut audit = SecurityAudit::new();
+        audit.record(&PermissionRequest::new(PermissionKind::FileRead, "a.txt", "read"), &PermissionDecision::allowed());
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sakha-audit-export-test-{}.json", std::process::id()));
+        audit.export_to_file(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<SecurityAuditEntry> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn export_json_on_empty_audit_is_empty_array() {
+        let audit = SecurityAudit::new();
+        assert_eq!(audit.export_json().unwrap(), "[]");
     }
 }

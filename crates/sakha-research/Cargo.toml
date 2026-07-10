@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 sakha-core = { workspace = true }
 sakha-security = { workspace = true }
+sakha-compression = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -18,13 +18,13 @@ pub struct InjectionScanResult {
 
 /// Scans and quarantines suspected prompt-injection content in fetched text.
 pub struct InjectionFilter {
-    patterns: Vec<&'static str>,
+    patterns: Vec<String>,
 }
 
 impl Default for InjectionFilter {
     fn default() -> Self {
         Self {
-            patterns: vec![
+            patterns: [
                 "ignore previous instructions",
                 "ignore all previous instructions",
                 "ignore the above instructions",
@@ -43,7 +43,10 @@ impl Default for InjectionFilter {
                 "forget everything above",
                 "this is your new directive",
                 "as an ai language model, you must",
-            ],
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         }
     }
 }
@@ -55,11 +58,14 @@ impl InjectionFilter {
 
     /// Builds a filter with an explicit pattern set (case-insensitive
     /// substring match), replacing the defaults. Useful for policy-driven
-    /// configuration.
+    /// configuration. Accepts owned `String`s or runtime `&str` slices alike
+    /// (anything convertible to `String`), not just `'static` string
+    /// literals, so callers can build patterns from config files or other
+    /// runtime data.
     pub fn with_patterns<I, S>(patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<&'static str>,
+        S: Into<String>,
     {
         Self { patterns: patterns.into_iter().map(Into::into).collect() }
     }
@@ -77,12 +83,12 @@ impl InjectionFilter {
 
         for line in text.lines() {
             let lower = line.to_lowercase();
-            let line_matches: Vec<&&str> = self.patterns.iter().filter(|p| lower.contains(**p)).collect();
+            let line_matches: Vec<&String> = self.patterns.iter().filter(|p| lower.contains(p.as_str())).collect();
             if line_matches.is_empty() {
                 sanitized_lines.push(line.to_string());
             } else {
                 for p in line_matches {
-                    let p_owned = p.to_string();
+                    let p_owned = p.clone();
                     if !matched.contains(&p_owned) {
                         matched.push(p_owned);
                     }
@@ -160,5 +166,29 @@ mod tests {
         assert!(wrapped.contains("untrusted_source"));
         assert!(wrapped.contains("not instructions"));
         assert!(wrapped.contains("some content"));
+    }
+
+    #[test]
+    fn with_patterns_accepts_owned_runtime_strings() {
+        // Regression test: `with_patterns` previously required
+        // `S: Into<&'static str>`, which only string literals satisfy. Owned
+        // `String`s built at runtime (e.g. loaded from a policy config file)
+        // must work too.
+        let runtime_pattern: String = format!("{}{}", "danger", "ous phrase");
+        let filter = InjectionFilter::with_patterns(vec![runtime_pattern]);
+        let result = filter.scan("this contains a dangerous phrase in it");
+        assert!(result.suspicious);
+        assert_eq!(result.matched_patterns, vec!["dangerous phrase".to_string()]);
+    }
+
+    #[test]
+    fn with_patterns_replaces_defaults_entirely() {
+        let filter = InjectionFilter::with_patterns(vec!["custom marker".to_string()]);
+        // A default pattern no longer matches once with_patterns replaces the set.
+        let result = filter.scan("ignore previous instructions");
+        assert!(!result.suspicious);
+
+        let result = filter.scan("has a custom marker in it");
+        assert!(result.suspicious);
     }
 }

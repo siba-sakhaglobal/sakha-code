@@ -159,7 +159,7 @@ impl PermissionPolicy {
                 )));
             }
             if let Some(m) = Self::first_match(&layer.allow_rules, &rule_key, namespace) {
-                return Ok(PermissionDecision::allowed_with_note(format!(
+                return Ok(PermissionDecision::allowed_with_reason(format!(
                     "allowed by {:?} policy rule '{}'",
                     layer.source.unwrap_or(PolicySource::BuiltinDefault),
                     m
@@ -184,16 +184,6 @@ impl PermissionPolicy {
             .iter()
             .find(|r| glob_match(r, rule_key) || glob_match(r, namespace))
             .map(|s| s.as_str())
-    }
-}
-
-impl PermissionDecision {
-    /// Allowed, but keep the reason around for audit trails (not part of the
-    /// public equality contract — `PermissionDecision::Allowed` still
-    /// compares equal to this since we intentionally don't attach a reason
-    /// field to the `Allowed` variant to keep `is_allowed()` simple).
-    fn allowed_with_note(_reason: impl Into<String>) -> Self {
-        PermissionDecision::Allowed
     }
 }
 
@@ -257,6 +247,21 @@ mod tests {
         let req = PermissionRequest::new(PermissionKind::ShellRunArbitrary, "rm -rf /", "run");
         let decision = policy.check(&req).unwrap();
         assert!(decision.needs_human_approval());
+    }
+
+    #[test]
+    fn allow_rule_match_preserves_reason_for_audit_trail() {
+        let policy = PermissionPolicy::new().with_layer(PolicyLayer {
+            source: Some(PolicySource::WorkspaceLocal),
+            allow_rules: vec!["shell.run_safe".into()],
+            ..Default::default()
+        });
+        let req = PermissionRequest::new(PermissionKind::ShellRunSafe, "echo hi", "run");
+        let decision = policy.check(&req).unwrap();
+        assert!(decision.is_allowed());
+        let reason = decision.reason().expect("allow-rule match must record a reason");
+        assert!(reason.contains("shell.run_safe"), "reason was: {reason}");
+        assert!(reason.contains("WorkspaceLocal"), "reason was: {reason}");
     }
 
     #[test]
