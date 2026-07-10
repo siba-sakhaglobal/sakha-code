@@ -1,0 +1,21 @@
+[package]
+name = "sakha-research"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sakha-core = { workspace = true }
+sakha-security = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+html2text = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

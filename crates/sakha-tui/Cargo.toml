@@ -1,0 +1,23 @@
+[package]
+name = "sakha-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sakha-tui"
+path = "src/main.rs"
+
+[dependencies]
+sakha-core = { workspace = true }
+sakha-agent = { workspace = true }
+sakha-loop = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

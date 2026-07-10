@@ -1,0 +1,29 @@
+[package]
+name = "sakha-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sakha"
+path = "src/main.rs"
+
+[dependencies]
+sakha-core = { workspace = true }
+sakha-agent = { workspace = true }
+sakha-loop = { workspace = true }
+sakha-memory = { workspace = true }
+sakha-tools = { workspace = true }
+sakha-provider = { workspace = true }
+sakha-security = { workspace = true }
+sakha-observability = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

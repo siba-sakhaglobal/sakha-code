@@ -1,0 +1,22 @@
+[package]
+name = "sakha-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sakha-core = { workspace = true }
+sakha-provider = { workspace = true }
+sakha-tools = { workspace = true }
+sakha-context = { workspace = true }
+sakha-compression = { workspace = true }
+sakha-security = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
