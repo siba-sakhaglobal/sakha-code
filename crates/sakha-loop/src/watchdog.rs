@@ -124,6 +124,7 @@ impl LoopWatchdog {
     pub fn check_budget(&self, ledger: &BudgetLedger) -> StallReport {
         let limits: Budget = ledger.limits();
         let mut reasons = Vec::new();
+        let wall_time_limit_ms = limits.max_wall_time.map(|d| d.as_millis() as u64);
         let dims = [
             (BudgetDimension::InputTokens, "input tokens", limits.max_input_tokens),
             (BudgetDimension::OutputTokens, "output tokens", limits.max_output_tokens),
@@ -131,6 +132,12 @@ impl LoopWatchdog {
             (BudgetDimension::ToolCalls, "tool calls", limits.max_tool_calls),
             (BudgetDimension::LoopIterations, "loop iterations", limits.max_loop_iterations),
             (BudgetDimension::FilesystemWrites, "filesystem writes", limits.max_filesystem_writes),
+            // Wall-clock time: spec "Loop Control Rules" -> "every loop must
+            // define max wall-clock time". `Budget::max_wall_time` is a
+            // `Duration`, not a plain `u64` limit, so it's translated to
+            // milliseconds here to match `BudgetDimension::WallTime`'s unit
+            // rather than being silently unreachable.
+            (BudgetDimension::WallTime, "wall-clock time (ms)", wall_time_limit_ms),
         ];
         for (dim, label, limit) in dims {
             if limit.is_some() && ledger.is_exhausted(dim) {
@@ -217,6 +224,19 @@ mod tests {
         let report = watchdog.check_budget(&ledger);
         assert!(report.stalled);
         assert!(report.reasons[0].contains("loop iterations"));
+    }
+
+    #[test]
+    fn wall_clock_budget_stops_loop_when_exhausted() {
+        // Spec "every loop must define max wall-clock time": `check_budget`
+        // must reach `BudgetDimension::WallTime`, not just iteration/cost/etc.
+        use std::time::Duration;
+        let ledger = BudgetLedger::new(Budget { max_wall_time: Some(Duration::from_secs(1)), ..Budget::unlimited() });
+        ledger.debit(BudgetDimension::WallTime, 1_000).unwrap();
+        let watchdog = LoopWatchdog::new(3);
+        let report = watchdog.check_budget(&ledger);
+        assert!(report.stalled);
+        assert!(report.reasons.iter().any(|r| r.contains("wall-clock")));
     }
 
     #[test]

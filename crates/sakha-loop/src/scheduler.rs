@@ -114,6 +114,14 @@ fn next_cron_lite_fire(
         .ok_or_else(|| SakhaError::integrity("sakha-loop", "failed to normalize candidate time"))?;
 
     const MAX_STEPS: u32 = 60 * 24 * 366 * 4; // ~4 years of minutes.
+    // Belt-and-suspenders wall-clock cap alongside the step cap: this is a
+    // pure in-process search (no I/O, no loop tick), but per the project's
+    // "no unbounded loop without a budget check" principle it must still
+    // bail out on real elapsed time, not just iteration count, in case a
+    // future field combination makes each step far more expensive than a
+    // simple field comparison.
+    const MAX_SEARCH_WALL_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+    let search_started = std::time::Instant::now();
     for _ in 0..MAX_STEPS {
         let matches = minute.is_none_or(|m| candidate.minute() == m)
             && hour.is_none_or(|h| candidate.hour() == h)
@@ -122,6 +130,12 @@ fn next_cron_lite_fire(
             && day_of_week.is_none_or(|dow| candidate.weekday().num_days_from_sunday() == dow);
         if matches {
             return Ok(candidate);
+        }
+        if search_started.elapsed() > MAX_SEARCH_WALL_TIME {
+            return Err(SakhaError::budget(
+                "sakha-loop",
+                "cron-lite next-fire search exceeded its wall-clock budget",
+            ));
         }
         candidate += ChronoDuration::minutes(1);
     }

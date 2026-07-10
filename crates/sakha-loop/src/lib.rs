@@ -14,11 +14,14 @@ pub mod watchdog;
 pub use event_queue::{InMemoryLoopQueue, LeasedMessage, LoopQueue, QueueMessage};
 pub use replay::{LoopSkill, LoopSkillRecorder, ReplayEngine, ReplayStep, ReplayTrace};
 pub use runtime::{
-    LoopController, LoopRuntime, LoopState, LoopTick, LoopTickResult, NullTickExecutor, StopReason, TickExecutor,
-    TickOutcome,
+    ApprovalStatus, ApprovalStore, FeedbackRecord, FeedbackSource, InMemoryApprovalStore, LoopBudget, LoopController,
+    LoopRuntime, LoopState, LoopTick, LoopTickResult, NullTickExecutor, StopReason, TickExecutor, TickOutcome,
 };
 pub use scheduler::{ImmediateScheduler, IntervalCronScheduler, ParsedSchedule, Scheduler};
-pub use spec::{CronSpec, EventSource, HandoffPolicy, LoopKind, LoopSpec, Trigger, VerifierSpec};
+pub use spec::{
+    CronSpec, EventSource, HandoffPolicy, IdempotencyMode, LoopKind, LoopSpec, SideEffectPermission, Trigger,
+    VerifierSpec,
+};
 pub use verification_loop::{
     run_check, run_checks, CheckResult, CheckSpec, CommandVerifier, Grade, NullVerifier, Rubric, VerificationResult,
     Verifier,
