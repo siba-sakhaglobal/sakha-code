@@ -130,6 +130,15 @@ impl SakhaError {
         Self::new(ErrorClass::Fatal, source_module, message)
     }
 
+    /// Constructs a non-retryable error for a code path that is intentionally
+    /// unimplemented (public API skeletons). Never panics; safe to call from
+    /// any stub body. Class is `Fatal` since callers should treat it as "this
+    /// capability does not exist yet" rather than something to retry.
+    pub fn not_implemented(source_module: impl Into<ModuleId>, message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Fatal, source_module, format!("not implemented: {}", message.into()))
+            .with_retryable(false)
+    }
+
     /// Overrides the retryable flag (e.g. a Transient error that has exhausted
     /// its idempotency guarantee, or a caller-forced non-retry).
     pub fn with_retryable(mut self, retryable: bool) -> Self {
@@ -220,5 +229,13 @@ mod tests {
     fn error_class_serializes_snake_case() {
         let json = serde_json::to_string(&ErrorClass::InvalidInput).unwrap();
         assert_eq!(json, "\"invalid_input\"");
+    }
+
+    #[test]
+    fn not_implemented_is_fatal_and_not_retryable() {
+        let err = SakhaError::not_implemented("sakha-provider", "stream()");
+        assert_eq!(err.class, ErrorClass::Fatal);
+        assert!(!err.retryable);
+        assert!(err.message.contains("stream()"));
     }
 }

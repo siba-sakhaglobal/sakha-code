@@ -12,11 +12,15 @@ path = "src/main.rs"
 sakha-core = { workspace = true }
 sakha-agent = { workspace = true }
 sakha-loop = { workspace = true }
+sakha-memory = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]

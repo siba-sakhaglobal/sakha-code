@@ -11,6 +11,7 @@ sakha-tools = { workspace = true }
 sakha-context = { workspace = true }
 sakha-compression = { workspace = true }
 sakha-security = { workspace = true }
+sakha-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -20,3 +21,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -15,6 +15,7 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 html2text = { workspace = true }
+chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
