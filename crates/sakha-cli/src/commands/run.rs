@@ -5,11 +5,12 @@
 use clap::Args;
 use std::io::Write;
 
+use sakha_memory::{SessionRecord, SessionStatus, TurnRecord};
 use sakha_provider::{MessageRole, ModelMessage, ModelRequest, StopReason};
 
 use crate::config::{default_config_path, load_config};
 use crate::output::{print_error, OutputFormat};
-use crate::runtime::{build_provider, build_tool_registry, run_agent_turn};
+use crate::runtime::{build_provider, build_session_store, build_tool_registry, run_agent_turn};
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -61,6 +62,29 @@ async fn run_async(args: RunArgs) -> i32 {
     let provider = build_provider(&config);
     let registry = build_tool_registry();
 
+    // Persist the run as a session (spec M1: "usage recorded, session
+    // persisted") — SQLite-backed when `db_path` is configured, in-memory
+    // otherwise, same store `chat`/`session list` use.
+    let store = match build_session_store(&config) {
+        Ok(store) => store,
+        Err(err) => {
+            print_error(&format!("failed to open session store: {err}"), args.output);
+            return exit_code::CONFIG_ERROR;
+        }
+    };
+    let session_id = sakha_core::SessionId::new();
+    let _ = store
+        .create_session(SessionRecord {
+            id: session_id,
+            workspace_id: sakha_core::WorkspaceId::new(),
+            goal_id: None,
+            status: SessionStatus::Active,
+            provider_profile: None,
+            created_at: sakha_core::time::now_utc(),
+            updated_at: sakha_core::time::now_utc(),
+        })
+        .await;
+
     let mut request = ModelRequest::new(config.provider.model.clone());
     request.messages.push(ModelMessage {
         role: MessageRole::User,
@@ -91,6 +115,16 @@ async fn run_async(args: RunArgs) -> i32 {
 
     match result {
         Ok((text, stop_reason)) => {
+            let _ = store
+                .append_turn(TurnRecord {
+                    id: sakha_core::TurnId::new(),
+                    session_id,
+                    input_text: args.prompt.clone(),
+                    output_text: Some(text.clone()),
+                    created_at: sakha_core::time::now_utc(),
+                })
+                .await;
+            let _ = store.update_session_status(session_id, SessionStatus::Completed).await;
             match output {
                 OutputFormat::Text => {
                     println!();
@@ -100,6 +134,7 @@ async fn run_async(args: RunArgs) -> i32 {
                         "prompt": args.prompt,
                         "response": text,
                         "stop_reason": stop_reason,
+                        "session_id": session_id.to_string(),
                     });
                     match serde_json::to_string_pretty(&payload) {
                         Ok(json) => println!("{json}"),
@@ -116,6 +151,7 @@ async fn run_async(args: RunArgs) -> i32 {
             }
         }
         Err(err) => {
+            let _ = store.update_session_status(session_id, SessionStatus::Blocked).await;
             print_error(&err.to_string(), output);
             exit_code::MODEL_ERROR
         }

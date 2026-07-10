@@ -91,6 +91,8 @@ Create `~/.sakha/config.toml`:
 
 **Local (Ollama) Example:**
 ```toml
+db_path = "~/.sakha/sakha.db"
+
 [provider]
 selection = "openai_compatible"
 base_url = "http://localhost:11434/v1"
@@ -98,18 +100,17 @@ model = "llama2:latest"
 api_key_env = "OLLAMA_API_KEY"  # Leave empty if not required
 
 # Optional: session store (use in-memory if omitted)
-db_path = "~/.sakha/sakha.db"
 ```
 
 **OpenAI-Compatible Cloud Example:**
 ```toml
+db_path = "~/.sakha/sakha.db"
+
 [provider]
 selection = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4-turbo"
 api_key_env = "OPENAI_API_KEY"
-
-db_path = "~/.sakha/sakha.db"
 ```
 
 **Testing/Offline (Default):**

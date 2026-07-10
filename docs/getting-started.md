@@ -227,7 +227,7 @@ Sessions persist when you configure a database path.
 
 ### Enable Session Persistence
 
-Edit `~/.sakha/config.toml` and add:
+Edit `~/.sakha/config.toml` and add (at the **top of the file**, before any `[section]` header — a top-level key placed after `[provider]` would be read as `provider.db_path` and silently ignored):
 
 ```toml
 db_path = "/path/to/sessions.sqlite3"

@@ -107,6 +107,8 @@ For providers that don't require auth (Ollama, LM Studio), leave this `null` or 
 **Default**: `null`  
 **Required**: No
 
+> **⚠️ Placement matters**: `db_path` is a *top-level* key. In TOML, any key written below a `[section]` header belongs to that section — so `db_path` placed after `[provider]` becomes `provider.db_path` and is silently ignored. Put `db_path` at the very top of the file, before any `[section]`.
+
 File path to an SQLite database for persistent session, turn, memory, and research storage.
 
 - When set: sessions created by `sakha chat`, `sakha loop`, etc. persist across CLI invocations. `sakha session list`, `sakha session resume` work as expected.
@@ -182,12 +184,12 @@ selection = "mock"
 ### Ollama (Local LLM)
 
 ```toml
+db_path = "/home/user/.sakha/sessions.sqlite3"
+
 [provider]
 selection = "open_ai_compatible"
 base_url = "http://localhost:11434/v1"
 model = "mistral"
-
-db_path = "/home/user/.sakha/sessions.sqlite3"
 ```
 
 Prerequisites:
@@ -197,13 +199,13 @@ Prerequisites:
 ### OpenAI
 
 ```toml
+db_path = "/home/user/.sakha/sessions.sqlite3"
+
 [provider]
 selection = "open_ai_compatible"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
-
-db_path = "/home/user/.sakha/sessions.sqlite3"
 ```
 
 Before running, set the API key:
@@ -215,12 +217,12 @@ export OPENAI_API_KEY="sk-..."
 ### LM Studio (Local)
 
 ```toml
+db_path = "/home/user/.sakha/sessions.sqlite3"
+
 [provider]
 selection = "open_ai_compatible"
 base_url = "http://localhost:1234/v1"
 model = "local-model"
-
-db_path = "/home/user/.sakha/sessions.sqlite3"
 ```
 
 Prerequisites:
@@ -229,11 +231,11 @@ Prerequisites:
 ### Development/Testing (Mock + Persistent Sessions)
 
 ```toml
+db_path = "/tmp/sakha-test-sessions.sqlite3"
+
 [provider]
 selection = "mock"
 model = "mock-model"
-
-db_path = "/tmp/sakha-test-sessions.sqlite3"
 ```
 
 Good for:
@@ -327,13 +329,13 @@ All fields except `provider.selection` are optional; missing fields use defaults
 ```bash
 mkdir -p ~/.sakha
 cat > ~/.sakha/config.toml << 'EOF'
+db_path = "/home/user/.sakha/sessions.sqlite3"
+
 [provider]
 selection = "open_ai_compatible"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
-
-db_path = "/home/user/.sakha/sessions.sqlite3"
 EOF
 ```
 
