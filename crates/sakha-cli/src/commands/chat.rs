@@ -14,6 +14,7 @@ use sakha_provider::{MessageRole, ModelMessage, ModelRequest};
 use crate::config::{default_config_path, load_config};
 use crate::output::{print_error, OutputFormat};
 use crate::runtime::{build_provider, build_session_store, build_tool_registry, run_agent_turn};
+use crate::skills::{build_startup_system_messages, discover_skills};
 
 #[derive(Debug, Args)]
 pub struct ChatArgs {
@@ -23,6 +24,12 @@ pub struct ChatArgs {
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
+
+    /// Inject a discovered skill's full instructions as a system message up
+    /// front, skipping the `skill.activate` round-trip. Must name a skill
+    /// discovered under the standard tiers (see `sakha skills list`).
+    #[arg(long)]
+    pub skill: Option<String>,
 }
 
 /// Starts an interactive chat loop: reads prompts from stdin (one per line,
@@ -89,6 +96,16 @@ async fn chat_async(args: ChatArgs, input: &mut impl BufRead, out: &mut impl Wri
         let _ = store.create_session(session).await;
     }
 
+    let cwd = std::env::current_dir().ok();
+    let (skills, _warnings) = discover_skills(cwd.as_deref());
+    let system_messages = match build_startup_system_messages(&skills, args.skill.as_deref()) {
+        Ok(messages) => messages,
+        Err(err) => {
+            print_error(&err, args.output);
+            return 2;
+        }
+    };
+
     let _ = writeln!(out, "sakha chat: session {session_id} (type 'exit' to leave)");
 
     loop {
@@ -116,6 +133,15 @@ async fn chat_async(args: ChatArgs, input: &mut impl BufRead, out: &mut impl Wri
         }
 
         let mut request = ModelRequest::new(config.provider.model.clone());
+        for message in &system_messages {
+            request.messages.push(ModelMessage {
+                tool_calls: Vec::new(),
+                role: MessageRole::System,
+                content: message.clone(),
+                tool_call_id: None,
+                name: None,
+            });
+        }
         request.messages.push(ModelMessage { tool_calls: Vec::new(),
             role: MessageRole::User,
             content: line.to_string(),
@@ -180,13 +206,40 @@ mod tests {
         assert_eq!(cli.args.session_id.as_deref(), Some("abc"));
     }
 
+    #[test]
+    fn chat_args_parse_with_skill_flag() {
+        use clap::Parser;
+        #[derive(Debug, Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: ChatArgs,
+        }
+        let cli = TestCli::try_parse_from(["sakha", "--skill", "review"]).unwrap();
+        assert_eq!(cli.args.skill.as_deref(), Some("review"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_unknown_skill_flag_fails_fast() {
+        let _home = crate::test_support::TempHome::new();
+
+        let mut input = Cursor::new(b"exit\n".to_vec());
+        let mut out = Vec::new();
+        let code = chat_async(
+            ChatArgs { session_id: None, output: OutputFormat::Text, skill: Some("does-not-exist".into()) },
+            &mut input,
+            &mut out,
+        )
+        .await;
+        assert_eq!(code, 2);
+    }
+
     #[tokio::test]
     async fn chat_echoes_mock_response_and_exits_on_quit() {
         let _home = crate::test_support::TempHome::new();
 
         let mut input = Cursor::new(b"hello there\nexit\n".to_vec());
         let mut out = Vec::new();
-        let code = chat_async(ChatArgs { session_id: None, output: OutputFormat::Text }, &mut input, &mut out).await;
+        let code = chat_async(ChatArgs { session_id: None, output: OutputFormat::Text, skill: None }, &mut input, &mut out).await;
         assert_eq!(code, 0);
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("sakha chat: session"));
@@ -200,7 +253,7 @@ mod tests {
 
         let mut input = Cursor::new(Vec::new());
         let mut out = Vec::new();
-        let code = chat_async(ChatArgs { session_id: None, output: OutputFormat::Text }, &mut input, &mut out).await;
+        let code = chat_async(ChatArgs { session_id: None, output: OutputFormat::Text, skill: None }, &mut input, &mut out).await;
         assert_eq!(code, 0);
     }
 
@@ -219,12 +272,12 @@ mod tests {
         crate::config::save_config(&crate::config::default_config_path(), &config).unwrap();
 
         let session_id = sakha_core::SessionId::new();
-        let args = ChatArgs { session_id: Some(session_id.to_string()), output: OutputFormat::Text };
+        let args = ChatArgs { session_id: Some(session_id.to_string()), output: OutputFormat::Text, skill: None };
 
         let mut first_input = Cursor::new(b"remember this\nexit\n".to_vec());
         let mut first_out = Vec::new();
         let first_code = chat_async(
-            ChatArgs { session_id: Some(session_id.to_string()), output: OutputFormat::Text },
+            ChatArgs { session_id: Some(session_id.to_string()), output: OutputFormat::Text, skill: None },
             &mut first_input,
             &mut first_out,
         )

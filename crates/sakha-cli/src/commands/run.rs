@@ -11,6 +11,7 @@ use sakha_provider::{MessageRole, ModelMessage, ModelRequest, StopReason};
 use crate::config::{default_config_path, load_config};
 use crate::output::{print_error, OutputFormat};
 use crate::runtime::{build_provider, build_session_store, build_tool_registry, run_agent_turn};
+use crate::skills::{build_startup_system_messages, discover_skills};
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -23,6 +24,12 @@ pub struct RunArgs {
     /// Override the model name from config for this run.
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Inject a discovered skill's full instructions as a system message up
+    /// front, skipping the `skill.activate` round-trip. Must name a skill
+    /// discovered under the standard tiers (see `sakha skills list`).
+    #[arg(long)]
+    pub skill: Option<String>,
 }
 
 /// Exit codes for `sakha run`, per spec "proper exit codes".
@@ -85,7 +92,26 @@ async fn run_async(args: RunArgs) -> i32 {
         })
         .await;
 
+    let cwd = std::env::current_dir().ok();
+    let (skills, _warnings) = discover_skills(cwd.as_deref());
+    let system_messages = match build_startup_system_messages(&skills, args.skill.as_deref()) {
+        Ok(messages) => messages,
+        Err(err) => {
+            print_error(&err, args.output);
+            return exit_code::CONFIG_ERROR;
+        }
+    };
+
     let mut request = ModelRequest::new(config.provider.model.clone());
+    for message in system_messages {
+        request.messages.push(ModelMessage {
+            tool_calls: Vec::new(),
+            role: MessageRole::System,
+            content: message,
+            tool_call_id: None,
+            name: None,
+        });
+    }
     request.messages.push(ModelMessage { tool_calls: Vec::new(),
         role: MessageRole::User,
         content: args.prompt.clone(),
@@ -188,7 +214,20 @@ mod tests {
         // on the host by pointing the config directory at an empty temp dir
         // for the duration of this test.
         let _home = crate::test_support::TempHome::new();
-        let code = execute(RunArgs { prompt: "hello".into(), output: OutputFormat::Json, model: None });
+        let code = execute(RunArgs { prompt: "hello".into(), output: OutputFormat::Json, model: None, skill: None });
         assert_eq!(code, exit_code::SUCCESS);
+    }
+
+    #[test]
+    fn parses_skill_flag() {
+        let cli = TestCli::try_parse_from(["sakha", "do it", "--skill", "review"]).unwrap();
+        assert_eq!(cli.args.skill.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn run_with_unknown_skill_flag_fails_fast() {
+        let _home = crate::test_support::TempHome::new();
+        let code = execute(RunArgs { prompt: "hello".into(), output: OutputFormat::Json, model: None, skill: Some("does-not-exist".into()) });
+        assert_eq!(code, exit_code::CONFIG_ERROR);
     }
 }

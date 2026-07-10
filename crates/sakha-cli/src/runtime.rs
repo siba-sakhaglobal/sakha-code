@@ -76,11 +76,16 @@ fn resolve_key_into_env(config: &SakhaConfig, backend: &dyn SecretBackend) {
 /// the agent loop can search/fetch the web regardless of whether any search
 /// backend env var happens to be configured — the tools themselves return a
 /// clear `invalid_input` error at call time when no backend is available.
+/// Also always includes `skill.activate` (see `crate::skills`), even when no
+/// skills are currently discoverable on disk — the tool itself returns a
+/// clear `invalid_input` error listing available names (empty list) at call
+/// time rather than being conditionally registered.
 pub fn build_tool_registry() -> ToolRegistry {
     let mut registry = sakha_tools::default_registry();
     for tool in sakha_research::web_tools() {
         registry.register(tool);
     }
+    registry.register(std::sync::Arc::new(crate::skills::SkillActivateTool));
     registry
 }
 

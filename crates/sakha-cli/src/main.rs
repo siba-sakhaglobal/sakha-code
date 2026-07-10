@@ -9,6 +9,7 @@ mod config;
 mod output;
 mod runtime;
 mod secrets;
+mod skills;
 #[cfg(test)]
 mod test_support;
 
@@ -26,6 +27,7 @@ use commands::providers::{ProvidersCatalogArgs, ProvidersListArgs, ProvidersUseA
 use commands::run::RunArgs;
 use commands::search::{FetchArgs, SearchArgs, SearchBackendsArgs};
 use commands::session::SessionCommand;
+use commands::skills::{SkillsListArgs, SkillsShowArgs};
 use commands::tools::ToolsListArgs;
 use output::OutputFormat;
 
@@ -66,6 +68,11 @@ pub enum Command {
     Tools {
         #[command(subcommand)]
         command: ToolsCommand,
+    },
+    /// Discover and inspect agent skills (`SKILL.md` instruction packs).
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
     },
     /// Search durable memory.
     Memory {
@@ -115,6 +122,12 @@ pub enum ProvidersCommand {
 #[derive(Debug, Subcommand)]
 pub enum ToolsCommand {
     List(ToolsListArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    List(SkillsListArgs),
+    Show(SkillsShowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +181,10 @@ fn main() {
         Command::Logout(args) => commands::login::execute_logout(args),
         Command::Tools { command } => match command {
             ToolsCommand::List(args) => commands::tools::execute(args),
+        },
+        Command::Skills { command } => match command {
+            SkillsCommand::List(args) => commands::skills::execute_list(args),
+            SkillsCommand::Show(args) => commands::skills::execute_show(args),
         },
         Command::Memory { command } => match command {
             MemoryCommand::Search(args) => commands::memory::execute(args),
@@ -290,6 +307,21 @@ mod tests {
     fn tools_list_subcommand_parses() {
         let cli = Cli::try_parse_from(["sakha", "tools", "list"]).unwrap();
         assert!(matches!(cli.command, Command::Tools { .. }));
+    }
+
+    #[test]
+    fn skills_list_subcommand_parses() {
+        let cli = Cli::try_parse_from(["sakha", "skills", "list"]).unwrap();
+        assert!(matches!(cli.command, Command::Skills { command: SkillsCommand::List(_) }));
+    }
+
+    #[test]
+    fn skills_show_subcommand_parses_name() {
+        let cli = Cli::try_parse_from(["sakha", "skills", "show", "review"]).unwrap();
+        match cli.command {
+            Command::Skills { command: SkillsCommand::Show(args) } => assert_eq!(args.name, "review"),
+            _ => panic!("expected Skills Show command"),
+        }
     }
 
     #[test]

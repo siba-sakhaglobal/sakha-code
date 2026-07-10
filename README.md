@@ -23,6 +23,7 @@ Sakha is a production-grade coding agent platform designed for:
 - **Provider gateway** — OpenAI-compatible abstraction with streaming and tool-use support
 - **MCP (Model Context Protocol) integration** — extend capabilities with external tools
 - **Multi-backend web search & fetch** — `web.search`/`web.fetch` agent tools and `sakha search`/`sakha fetch` CLI commands, backed by a prioritized pool of pluggable providers (Firecrawl, Brave, Tavily, Serper, SerpAPI, Exa, SearXNG) with automatic quota/auth failover — see [docs/web-search.md](docs/web-search.md)
+- **Agent skills** — Claude-Code/Gemini-CLI-compatible `SKILL.md` instruction packs, discovered from `.sakha/`, `.agents/`, `.claude/`, and `.gemini/` directories, listed compactly in the system prompt, and activated on demand via the `skill.activate` tool (or up front via `--skill`) — see [docs/skills.md](docs/skills.md)
 - **Local-first trust model** — workspace state remains source of truth; all logs inspectable
 
 ## Workspace Structure
