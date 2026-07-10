@@ -34,6 +34,12 @@ pub struct ProviderConfig {
     #[serde(default = "default_model")]
     pub model: String,
     pub api_key_env: Option<String>,
+    /// The `sakha-cli::catalog::ProviderPreset` id this config was derived
+    /// from (via `sakha login`/`sakha providers use`), if any. Lets
+    /// `runtime::build_provider` know which keyring entry to fall back to
+    /// when `api_key_env` isn't already set in the process environment.
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 fn default_base_url() -> String {
@@ -51,6 +57,7 @@ impl Default for ProviderConfig {
             base_url: default_base_url(),
             model: default_model(),
             api_key_env: None,
+            preset: None,
         }
     }
 }

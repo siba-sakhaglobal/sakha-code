@@ -101,6 +101,57 @@ sakha run "prompt"
 
 For providers that don't require auth (Ollama, LM Studio), leave this `null` or omit it.
 
+#### `provider.preset`
+
+**Type**: String or null
+**Default**: `null`
+**Required**: No
+
+The [provider catalog](./providers.md) preset id (e.g. `"openai"`,
+`"openrouter"`, `"ollama"`) this configuration was derived from, set
+automatically by `sakha login <preset>` and `sakha providers use <preset>`.
+Used only as a fallback key-lookup hint: when `provider.api_key_env` names an
+environment variable that is **not** set in the process, Sakha checks the OS
+credential manager for a secret stored under this preset id (via `sakha
+login`) and loads it into that env var for the current process only — it is
+never written back to the config file.
+
+```toml
+[provider]
+selection = "open_ai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+model = "openrouter/auto"
+api_key_env = "OPENROUTER_API_KEY"
+preset = "openrouter"
+```
+
+You do not need to set this by hand; `sakha login`/`sakha providers use`
+manage it. See [Provider Catalog & Login](./providers.md) for the full
+picture (OAuth vs. pasted-key vs. `--api-key`, and where keys actually live).
+
+### `.env` Autoload
+
+Before loading `~/.sakha/config.toml` or dispatching any command, Sakha
+tries to load two `.env` files, in order:
+
+1. `./.env` (current working directory)
+2. `{SAKHA_HOME or ~}/.sakha/.env`
+
+Both loads are **non-overriding**: a variable already present in the process
+environment always wins over the same variable in a `.env` file. Missing
+files are ignored silently — most setups won't have either.
+
+```bash
+# ./.env or ~/.sakha/.env
+OPENAI_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
+```
+
+This is a convenience layered on top of the normal `provider.api_key_env`
+resolution (env var → keyring fallback described above) — it does not change
+config file syntax, and secrets are still never written to
+`~/.sakha/config.toml`.
+
 ### `db_path` – Session Database
 
 **Type**: String or null  

@@ -87,7 +87,37 @@ sakha --help
 
 ### 2. Configure a Provider
 
-Create `~/.sakha/config.toml`:
+The fastest way to get connected is `sakha login`, which authenticates
+against a [built-in provider preset](./docs/providers.md) and stores the key
+in your OS credential manager (never in the config file):
+
+```bash
+# OpenRouter: opens your browser for an OAuth PKCE login
+sakha login openrouter
+
+# Any other provider: opens the provider's key page, then prompts you to paste the key
+sakha login gemini
+
+# Fully non-interactive (e.g. CI/scripts)
+sakha login openai --api-key sk-...
+```
+
+Browse the full catalog (id, base URL, default model, auth method) with:
+
+```bash
+sakha providers catalog
+```
+
+If you'd rather manage the key yourself (env var or `.env` file — see
+[.env Autoload](./docs/configuration.md#env-autoload)), point config at a
+preset without logging in:
+
+```bash
+sakha providers use openai
+export OPENAI_API_KEY=sk-...
+```
+
+Or hand-edit `~/.sakha/config.toml` directly:
 
 **Local (Ollama) Example:**
 ```toml
@@ -171,6 +201,7 @@ sakha daemon run
 - `base_url`: OpenAI-compatible endpoint URL (e.g., `http://localhost:11434/v1` for Ollama)
 - `model`: Model name as recognized by the provider (e.g., `llama2:latest`, `gpt-4-turbo`)
 - `api_key_env`: Name of environment variable holding the API key (e.g., `OPENAI_API_KEY`, `OLLAMA_API_KEY`). Omit for providers that don't require authentication.
+- `preset`: Catalog preset id set automatically by `sakha login`/`sakha providers use` (e.g. `"openai"`). See [Provider Catalog & Login](./docs/providers.md).
 
 **Optional:**
 - `db_path`: Path to SQLite database for durable session storage. If omitted, sessions are in-memory (non-durable).
@@ -218,6 +249,8 @@ Complete design, architecture, and implementation specs live in the [Sakha Codin
 - `21-prompt-system.md` — Prompt assembly, compression, and context routing
 - `modules/` — Deep dives on providers, tools, MCP, loops, and verification
 - `crates/crate-work-breakdown.md` — Detailed crate responsibilities and public APIs
+- [`docs/providers.md`](./docs/providers.md) — Provider catalog, `sakha login`/`sakha logout`, and the key-storage security model
+- [`docs/configuration.md`](./docs/configuration.md) — Full `~/.sakha/config.toml` schema, including `.env` autoload
 
 ## License
 

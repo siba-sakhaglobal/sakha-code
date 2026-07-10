@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod eval;
+pub mod login;
 pub mod loops;
 pub mod mcp;
 pub mod memory;

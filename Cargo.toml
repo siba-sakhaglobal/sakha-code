@@ -56,6 +56,12 @@ similar = "2"
 url = "2"
 html2text = "0.12"
 tokio-util = "0.7"
+keyring = "3"
+webbrowser = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rpassword = "7"
+dotenvy = "0.15"
 
 # Internal crates
 sakha-core = { path = "crates/sakha-core" }

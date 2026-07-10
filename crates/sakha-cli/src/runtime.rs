@@ -15,14 +15,30 @@ use sakha_security::PermissionPolicy;
 use sakha_tools::{ToolContext, ToolName, ToolRegistry};
 
 use crate::config::{ProviderSelection, SakhaConfig};
+use crate::secrets::{KeyringSecretBackend, SecretBackend};
 
 /// Builds a `ProviderClient` per the configured `ProviderSelection`. Never
 /// requires network access when `ProviderSelection::Mock` is selected (the
 /// default), so the CLI always has a working offline smoke-test path.
+///
+/// Key resolution precedence for `ProviderSelection::OpenAiCompatible`, per
+/// spec `modules/17-config-secrets-policy.md` "keys live in the OS
+/// credential manager or the environment, never in the config file":
+///   1. If `config.provider.api_key_env` names an environment variable that
+///      is already set in this process, leave it untouched — the user (or
+///      their shell/.env) is the source of truth and `OpenAiCompatibleClient`
+///      will read it directly.
+///   2. Otherwise, if `config.provider.preset` identifies a catalog preset
+///      and the OS keyring has a secret stored for it (via `sakha login`),
+///      copy that secret into the env var named by `api_key_env` for this
+///      process only (`std::env::set_var`) before building the profile. This
+///      never touches disk and does not leak the key to child processes'
+///      config files.
 pub fn build_provider(config: &SakhaConfig) -> Arc<dyn ProviderClient> {
     match config.provider.selection {
         ProviderSelection::Mock => Arc::new(MockProviderClient::default()),
         ProviderSelection::OpenAiCompatible => {
+            resolve_key_into_env(config, &KeyringSecretBackend::new());
             let mut profile = sakha_provider::ProviderProfile::openai_compatible(
                 "configured",
                 &config.provider.base_url,
@@ -31,6 +47,26 @@ pub fn build_provider(config: &SakhaConfig) -> Arc<dyn ProviderClient> {
             profile.api_key_ref = config.provider.api_key_env.clone();
             Arc::new(OpenAiCompatibleClient::new(profile))
         }
+    }
+}
+
+/// Implements the precedence documented on `build_provider`: env var already
+/// set wins; otherwise falls back to the keyring entry for
+/// `config.provider.preset`, setting it into the process environment.
+/// Split out from `build_provider` so tests can exercise the precedence
+/// logic against an injected `SecretBackend` without touching the real OS
+/// keyring.
+fn resolve_key_into_env(config: &SakhaConfig, backend: &dyn SecretBackend) {
+    let Some(env_name) = &config.provider.api_key_env else { return };
+    if std::env::var_os(env_name).is_some() {
+        // (1) Existing env var always wins — do nothing.
+        return;
+    }
+    let Some(preset_id) = &config.provider.preset else { return };
+    if let Ok(Some(secret)) = backend.get(preset_id) {
+        // (2) Fall back to the keyring-stored secret for the configured
+        // preset, process-local only.
+        std::env::set_var(env_name, secret);
     }
 }
 
@@ -204,6 +240,16 @@ pub async fn run_agent_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::test_support::InMemorySecretBackend;
+    use std::sync::{Mutex, OnceLock};
+
+    /// `resolve_key_into_env` reads/writes process-global env vars; this
+    /// lock serializes the tests below against each other (mirrors
+    /// `test_support::TempHome`'s home-dir lock) so they can't race.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[tokio::test]
     async fn build_provider_mock_streams_without_network() {
@@ -211,6 +257,62 @@ mod tests {
         let provider = build_provider(&config);
         let health = provider.health().await.unwrap();
         assert_eq!(health, sakha_provider::ProviderHealth::Healthy);
+    }
+
+    /// (1) An already-set env var wins over any keyring-stored secret.
+    #[test]
+    fn resolve_key_into_env_prefers_existing_env_var() {
+        let _lock = env_lock();
+        let env_name = "SAKHA_TEST_PRECEDENCE_ENV_WINS";
+        std::env::set_var(env_name, "from-env");
+
+        let mut config = SakhaConfig::default();
+        config.provider.api_key_env = Some(env_name.to_string());
+        config.provider.preset = Some("openai".to_string());
+
+        let backend = InMemorySecretBackend::new();
+        backend.set("openai", "from-keyring").unwrap();
+
+        resolve_key_into_env(&config, &backend);
+        assert_eq!(std::env::var(env_name).unwrap(), "from-env");
+        std::env::remove_var(env_name);
+    }
+
+    /// (2) Falls back to the keyring secret for `config.provider.preset` when
+    /// the env var is unset.
+    #[test]
+    fn resolve_key_into_env_falls_back_to_keyring_when_env_unset() {
+        let _lock = env_lock();
+        let env_name = "SAKHA_TEST_PRECEDENCE_KEYRING_FALLBACK";
+        std::env::remove_var(env_name);
+
+        let mut config = SakhaConfig::default();
+        config.provider.api_key_env = Some(env_name.to_string());
+        config.provider.preset = Some("openai".to_string());
+
+        let backend = InMemorySecretBackend::new();
+        backend.set("openai", "from-keyring").unwrap();
+
+        resolve_key_into_env(&config, &backend);
+        assert_eq!(std::env::var(env_name).unwrap(), "from-keyring");
+        std::env::remove_var(env_name);
+    }
+
+    /// Neither env var nor preset/keyring secret present: nothing is set,
+    /// and no error occurs.
+    #[test]
+    fn resolve_key_into_env_no_op_when_nothing_available() {
+        let _lock = env_lock();
+        let env_name = "SAKHA_TEST_PRECEDENCE_NOTHING_AVAILABLE";
+        std::env::remove_var(env_name);
+
+        let mut config = SakhaConfig::default();
+        config.provider.api_key_env = Some(env_name.to_string());
+        config.provider.preset = None;
+
+        let backend = InMemorySecretBackend::new();
+        resolve_key_into_env(&config, &backend);
+        assert!(std::env::var(env_name).is_err());
     }
 
     #[tokio::test]
