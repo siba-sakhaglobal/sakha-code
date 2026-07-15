@@ -9,3 +9,7 @@ Cargo.lock.bak
 *.sqlite
 *.sqlite3
 .omc/
+node_modules/
+dist/
+*.log
+*.sakha-bak
