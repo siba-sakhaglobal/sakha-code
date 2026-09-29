@@ -2,6 +2,10 @@
 
 A clean-room coding assistant for local and remote software engineering automation, built in Rust with provider-neutral LLM routing, compression-aware context, and safe tool automation.
 
+<p align="center">
+  <img src="banner_image.png" alt="Sakha Coding Agent" width="100%">
+</p>
+
 ## What Is Sakha?
 
 Sakha is a production-grade coding agent platform designed for:
